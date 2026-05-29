@@ -4,8 +4,11 @@ import os
 import glob
 import logging
 
+os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
 if isinstance(sys.stdout, io.TextIOWrapper):
     sys.stdout.reconfigure(encoding='utf-8')
+if isinstance(sys.stderr, io.TextIOWrapper):
+    sys.stderr.reconfigure(encoding='utf-8')
 import anthropic
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
@@ -22,7 +25,10 @@ _raw_ids = os.environ.get("ALLOWED_USER_IDS", "")
 ALLOWED_USER_IDS = [int(uid.strip()) for uid in _raw_ids.split(",") if uid.strip()]
 # ============================================================
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    handlers=[logging.StreamHandler(stream=sys.stdout)],
+)
 
 
 def load_knowledge(folder="knowledge"):
