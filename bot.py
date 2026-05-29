@@ -211,7 +211,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(assistant_reply)
 
     except Exception as e:
-        logging.error(f"Erro na API Claude: {e}")
+        import traceback
+        logging.error(f"Erro na API Claude: {e}\n{traceback.format_exc()}")
         await update.message.reply_text(
             "⚠️ Ocorreu um erro ao processar sua mensagem. Tente novamente."
         )
