@@ -1,20 +1,48 @@
 import os
+import glob
 import logging
+import anthropic
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
-from openai import OpenAI
 
+# ============================================================
+# CONFIGURAÇÃO
+# ============================================================
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 
+# IDs do Telegram de quem pode usar o bot
+# Para descobrir seu ID: fale com @userinfobot no Telegram
 _raw_ids = os.environ.get("ALLOWED_USER_IDS", "")
 ALLOWED_USER_IDS = [int(uid.strip()) for uid in _raw_ids.split(",") if uid.strip()]
+# ============================================================
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
+
+def load_knowledge(folder="knowledge"):
+    """Carrega todos os arquivos .md da pasta knowledge."""
+    texts = []
+    files = sorted(glob.glob(f"{folder}/*.md"))
+    for filepath in files:
+        with open(filepath, "r", encoding="utf-8") as f:
+            filename = os.path.basename(filepath)
+            content = f.read()
+            texts.append(f"### {filename}\n{content}")
+    if texts:
+        return "\n\n---\n\n".join(texts)
+    return ""
+
+
+KNOWLEDGE = load_knowledge()
+
+KNOWLEDGE_SECTION = f"""
+=== DOCUMENTOS INTERNOS DA ESCOLINHA ===
+Os documentos abaixo são materiais internos da escola. Siga-os com prioridade máxima.
+
+{KNOWLEDGE}
+""" if KNOWLEDGE else ""
+
 
 SYSTEM_PROMPT = """
 Você é o assistente interno da nossa escolinha/creche em Calgary, Alberta, Canada.
@@ -87,24 +115,18 @@ Você é um assistente profissional, caloroso e prático. Responde em português
 3. Para questões de regulação, sempre recomende verificar com Alberta Children's Services para casos específicos.
 4. Não tome decisões financeiras ou jurídicas — oriente, não decida.
 5. Seja empático e apoiador — gestores de creche têm muito na cabeça!
-"""
+""" + KNOWLEDGE_SECTION
+
 
 conversation_history: dict[int, list] = {}
-client = OpenAI(api_key=OPENAI_API_KEY)
 
-
-def is_allowed(user_id: int) -> bool:
-    if not ALLOWED_USER_IDS:
-        logger.warning("ALLOWED_USER_IDS is empty — all users are blocked. Set it in Secrets.")
-        return False
-    return user_id in ALLOWED_USER_IDS
+client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if not is_allowed(user_id):
+    if user_id not in ALLOWED_USER_IDS:
         await update.message.reply_text("⛔ Acesso não autorizado.")
-        logger.warning(f"Unauthorized access attempt from user_id={user_id}")
         return
     conversation_history[user_id] = []
     await update.message.reply_text(
@@ -122,7 +144,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if not is_allowed(user_id):
+    if user_id not in ALLOWED_USER_IDS:
         return
     conversation_history[user_id] = []
     await update.message.reply_text("🔄 Conversa reiniciada.")
@@ -131,7 +153,7 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
-    if not is_allowed(user_id):
+    if user_id not in ALLOWED_USER_IDS:
         await update.message.reply_text("⛔ Acesso não autorizado.")
         return
 
@@ -145,6 +167,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "content": user_text
     })
 
+    # Mantém histórico de no máximo 20 mensagens (10 trocas)
     if len(conversation_history[user_id]) > 20:
         conversation_history[user_id] = conversation_history[user_id][-20:]
 
@@ -154,15 +177,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     try:
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + conversation_history[user_id]
-
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",  # mais barato, ótimo para este uso
             max_tokens=1500,
-            messages=messages
+            system=[
+                {
+                    "type": "text",
+                    "text": SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral"}  # prompt caching: economiza ~70%
+                }
+            ],
+            messages=conversation_history[user_id]
         )
 
-        assistant_reply = response.choices[0].message.content
+        assistant_reply = response.content[0].text
 
         conversation_history[user_id].append({
             "role": "assistant",
@@ -170,28 +198,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         })
 
         await update.message.reply_text(assistant_reply)
-        logger.info(f"Replied to user_id={user_id}")
 
     except Exception as e:
-        logger.error(f"OpenAI API error for user_id={user_id}: {e}")
+        logging.error(f"Erro na API Claude: {e}")
         await update.message.reply_text(
             "⚠️ Ocorreu um erro ao processar sua mensagem. Tente novamente."
         )
 
 
 def main():
-    if not ALLOWED_USER_IDS:
-        logger.error(
-            "ALLOWED_USER_IDS secret is not set or empty. "
-            "Add it to Replit Secrets as a comma-separated list of Telegram user IDs, e.g.: 123456789,987654321"
-        )
-
-    logger.info(f"Starting bot with {len(ALLOWED_USER_IDS)} allowed user(s)")
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    logger.info("Bot running...")
+    print("Bot rodando...")
     app.run_polling()
 
 
