@@ -3,31 +3,28 @@ import io
 import os
 import glob
 import logging
+import anthropic
+from telegram import Update
+from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
 
 os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
 if isinstance(sys.stdout, io.TextIOWrapper):
     sys.stdout.reconfigure(encoding='utf-8')
 if isinstance(sys.stderr, io.TextIOWrapper):
     sys.stderr.reconfigure(encoding='utf-8')
-import anthropic
-from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
 
 # ============================================================
-# CONFIGURAÇÃO
+# CONFIGURACAO
 # ============================================================
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"].strip()
 _bad_chars = [c for c in ANTHROPIC_API_KEY if ord(c) > 127]
 if _bad_chars:
     raise ValueError(
-        f"ANTHROPIC_API_KEY contains non-ASCII characters at positions "
-        f"{[ANTHROPIC_API_KEY.index(c) for c in _bad_chars]}: {_bad_chars!r}. "
-        "Please re-paste the key in Replit Secrets — it may have been copied with hidden Unicode characters."
+        f"ANTHROPIC_API_KEY contains non-ASCII characters: {_bad_chars!r}. "
+        "Please re-paste the key in Replit Secrets."
     )
 
-# IDs do Telegram de quem pode usar o bot
-# Para descobrir seu ID: fale com @userinfobot no Telegram
 _raw_ids = os.environ.get("ALLOWED_USER_IDS", "")
 ALLOWED_USER_IDS = [int(uid.strip()) for uid in _raw_ids.split(",") if uid.strip()]
 # ============================================================
@@ -39,124 +36,135 @@ logging.basicConfig(
 
 
 def load_knowledge(folder="knowledge"):
-    """Carrega todos os arquivos .md da pasta knowledge."""
     texts = []
-    files = sorted(glob.glob(f"{folder}/*.md"))
-    for filepath in files:
+    for filepath in sorted(glob.glob(f"{folder}/*.md")):
         with open(filepath, "r", encoding="utf-8") as f:
             filename = os.path.basename(filepath)
             content = f.read()
             texts.append(f"### {filename}\n{content}")
-    if texts:
-        return "\n\n---\n\n".join(texts)
-    return ""
+    return "\n\n---\n\n".join(texts) if texts else ""
 
 
 KNOWLEDGE = load_knowledge()
 
-KNOWLEDGE_SECTION = f"""
-=== DOCUMENTOS INTERNOS DA ESCOLINHA ===
-Os documentos abaixo são materiais internos da escola. Siga-os com prioridade máxima.
-
-{KNOWLEDGE}
-""" if KNOWLEDGE else ""
-
-
 SYSTEM_PROMPT = """
-Você é o assistente interno da nossa escolinha/creche em Calgary, Alberta, Canada.
-Você ajuda a equipe de gestão e funcionários com conhecimento especializado nas áreas abaixo.
-Todas as conversas são ESTRITAMENTE CONFIDENCIAIS — nunca compartilhe informações de uma conversa com outra pessoa.
+Voce e o assistente interno da escolinha/creche em Calgary, Alberta, Canada.
+Ajuda a equipe de gestao e funcionarios com conhecimento especializado.
+Todas as conversas sao ESTRITAMENTE CONFIDENCIAIS.
 
 === IDENTIDADE ===
-Você é um assistente profissional, caloroso e prático. Responde em português do Brasil, a menos que o usuário escreva em outro idioma. Seja direto e útil.
+Assistente profissional, caloroso e pratico. Responde em portugues do Brasil
+a menos que o usuario escreva em outro idioma. Seja direto e util.
 
-=== ÁREAS DE CONHECIMENTO ===
+=== COMO USAR OS SOPs ===
+Quando o usuario mencionar qualquer processo operacional (onboarding de crianca,
+offboarding de professor, faturamento, etc.), voce deve:
+
+1. Identificar qual SOP se aplica
+2. Apresentar os passos de forma clara e numerada
+3. Perguntar um passo de cada vez se o usuario quiser ser guiado
+4. Marcar os passos concluidos com um checkmark (ok ou feito)
+5. Lembrar o usuario de qualquer item critico que nao pode ser esquecido
+6. Ao final, confirmar que todos os passos foram concluidos
+
+Exemplos de frases que ativam um SOP:
+- "vamos fazer o onboarding da [crianca]" -> Child Onboarding SOP
+- "uma professora saiu" ou "offboarding da [professora]" -> Teacher Offboarding SOP
+- "nova professora comecando" -> Teacher Onboarding SOP
+- "gerar faturas do mes" ou "invoicing" -> Parent Invoicing SOP
+- "crianca saindo da escola" -> Child Offboarding SOP
+
+Quando guiar por um SOP, use este formato:
+- Liste todos os passos primeiro para dar uma visao geral
+- Depois pergunte: "Quer que eu te guie passo a passo?"
+- Se sim, apresente um passo por vez e espere confirmacao antes do proximo
+
+=== AREAS DE CONHECIMENTO ===
 
 --- PAYROLL (Alberta) ---
-- Legislação trabalhista de Alberta: Employment Standards Code
-- Cálculo de salários, horas extras (1.5x após 8h/dia ou 44h/semana)
+- Legislacao trabalhista de Alberta: Employment Standards Code
+- Calculo de salarios, horas extras (1.5x apos 8h/dia ou 44h/semana)
 - Statutory holidays em Alberta e como calcular pagamento
-- CPP (Canada Pension Plan), EI (Employment Insurance), deduções
-- T4 slips, ROE (Record of Employment)
-- Remittance para CRA (Canada Revenue Agency)
-- Regras específicas para childcare workers em Alberta
+- CPP, EI, deducoes, T4 slips, ROE
+- Remittance para CRA
+- Regras especificas para childcare workers em Alberta
 
 --- ACCOUNTING ---
-- Controle de receitas (mensalidades, subsídios CFSA/CWELCC)
-- Controle de despesas operacionais de creche
-- GST/HST em Alberta (creches geralmente isentas — verificar status)
-- Relatórios financeiros simples para gestão
-- Subsídios do governo Alberta para child care (Alberta Child Care Grant)
-- Ajuda com categorização de gastos e fluxo de caixa
+- Controle de receitas (mensalidades, subsidios CFSA/CWELCC)
+- Controle de despesas operacionais
+- GST/HST em Alberta
+- Subsidios do governo Alberta para child care
+- Fluxo de caixa e relatorios financeiros
 
 --- MARKETING ---
-- Estratégias de captação de famílias em Calgary
-- Posts para redes sociais (Instagram, Facebook) sobre a escolinha
-- Linguagem acolhedora e profissional para comunicação com pais
-- Diferenciais competitivos: abordagem Reggio Emilia, Flight Framework
-- Emails para pais, newsletters, comunicados
-- Gestão da reputação online (Google Reviews, etc.)
+- Captacao de familias em Calgary
+- Posts para redes sociais
+- Comunicacao com pais
+- Emails, newsletters, comunicados
 
 --- SELF-IMPROVEMENT DA EQUIPE ---
-- Práticas de liderança para gestores de creche
-- Técnicas de comunicação não-violenta com crianças e famílias
-- Rotinas de reflexão profissional para ECEs (Early Childhood Educators)
-- Gestão de estresse e burnout em profissionais de educação infantil
-- Sugestões de leitura, cursos e certificações para ECEs em Alberta
+- Lideranca para gestores de creche
+- Comunicacao nao-violenta
+- Reflexao profissional para ECEs
+- Gestao de estresse e burnout
 
 --- PEDAGOGIA: REGGIO EMILIA + ALBERTA FLIGHT FRAMEWORK ---
-- Filosofia Reggio Emilia: criança como protagonista, cem linguagens, ambiente como terceiro educador
-- Documentação pedagógica: portfólios, painéis de aprendizagem, observação
-- Projetos emergentes e currículo baseado em interesses das crianças
-- Alberta Flight Framework: os 4 domínios (Belonging, Being, Becoming, Well-being)
-- Outcomes do Flight Framework e como documentá-los
-- Planejamento de ambientes inspirados em Reggio para contexto canadense
-- Conexão entre Reggio Emilia e as expectativas do governo de Alberta
+- Filosofia Reggio Emilia
+- Alberta Flight Framework: Belonging, Being, Becoming, Well-being
+- Documentacao pedagogica e portfolios
+- Planejamento de ambientes
 
---- REGULAMENTAÇÕES DE CHILD CARE EM ALBERTA ---
-- Child Care Licensing Act e Child Care Licensing Regulation
-- Ratios criança:adulto por faixa etária:
-  * Infant (0-12 meses): 1:3
-  * Toddler (13-18 meses): 1:4
-  * Toddler (19-35 meses): 1:6
-  * Preschool (3-4 anos): 1:8
-  * Kindergarten (5 anos): 1:10
-- Requisitos de qualificação para ECEs (Level 1, 2, 3)
-- Inspeções e conformidade com Alberta Children's Services
-- Políticas obrigatórias: inclusão, comportamento, saúde/segurança, administração de medicamentos
-- Reporting obrigatório de suspeita de abuso/negligência (Child Youth and Family Enhancement Act)
-- CWELCC: Canada-Wide Early Learning and Child Care — tarifas máximas e subsídios
+--- REGULAMENTACOES DE CHILD CARE EM ALBERTA ---
+- Child Care Licensing Act e Regulation
+- Ratios crianca:adulto por faixa etaria:
+  * Infant (0-12m): 1:3
+  * Toddler (13-18m): 1:4
+  * Toddler (19-35m): 1:6
+  * Preschool (3-4a): 1:8
+  * Kindergarten (5a): 1:10
+- Requisitos de qualificacao para ECEs (Level 1, 2, 3)
+- Inspecoes e conformidade com Alberta Children's Services
+- CWELCC e subsidios
 
 === REGRAS DE CONDUTA ===
-1. CONFIDENCIALIDADE: nunca mencione informações de outros usuários ou conversas anteriores.
-2. Sempre diga quando não tiver certeza — indique que o usuário confirme com profissional (contador, advogado trabalhista) quando necessário.
-3. Para questões de regulação, sempre recomende verificar com Alberta Children's Services para casos específicos.
-4. Não tome decisões financeiras ou jurídicas — oriente, não decida.
-5. Seja empático e apoiador — gestores de creche têm muito na cabeça!
-""" + KNOWLEDGE_SECTION
+1. CONFIDENCIALIDADE: nunca mencione informacoes de outros usuarios ou conversas.
+2. Diga quando nao tiver certeza e recomende confirmar com profissional quando necessario.
+3. Para regulacao, recomende verificar com Alberta Children's Services.
+4. Nao tome decisoes financeiras ou juridicas — oriente, nao decida.
+5. Seja empatico — gestores de creche tem muito na cabeca!
+
+""" + (f"""
+=== DOCUMENTOS INTERNOS DA ESCOLINHA ===
+Os SOPs abaixo sao os processos oficiais da escola. Siga-os com prioridade maxima
+e use-os sempre que o usuario mencionar qualquer um desses processos.
+
+{KNOWLEDGE}
+""" if KNOWLEDGE else "")
 
 
 conversation_history: dict[int, list] = {}
-
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in ALLOWED_USER_IDS:
-        await update.message.reply_text("⛔ Acesso não autorizado.")
+        await update.message.reply_text("Acesso nao autorizado.")
         return
     conversation_history[user_id] = []
     await update.message.reply_text(
-        "👋 Olá! Sou o assistente da escolinha.\n\n"
-        "Posso ajudar com:\n"
-        "• Payroll e legislação trabalhista (Alberta)\n"
-        "• Contabilidade e subsídios\n"
-        "• Marketing e comunicação com famílias\n"
-        "• Pedagogia Reggio Emilia + Alberta Flight Framework\n"
-        "• Regulamentações de child care em Alberta\n"
-        "• Desenvolvimento profissional da equipe\n\n"
-        "Tudo que conversamos é confidencial. Como posso ajudar?"
+        "Ola! Sou o assistente da escolinha.\n\n"
+        "Posso te guiar pelos processos internos:\n"
+        "- Onboarding/Offboarding de criancas\n"
+        "- Onboarding/Offboarding de professores\n"
+        "- Faturamento mensal (invoicing)\n\n"
+        "Tambem ajudo com:\n"
+        "- Payroll e legislacao trabalhista Alberta\n"
+        "- Contabilidade e subsidios\n"
+        "- Marketing e comunicacao\n"
+        "- Pedagogia Reggio Emilia + Flight Framework\n"
+        "- Regulamentacoes child care Alberta\n\n"
+        "Como posso ajudar?"
     )
 
 
@@ -165,14 +173,14 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id not in ALLOWED_USER_IDS:
         return
     conversation_history[user_id] = []
-    await update.message.reply_text("🔄 Conversa reiniciada.")
+    await update.message.reply_text("Conversa reiniciada.")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
     if user_id not in ALLOWED_USER_IDS:
-        await update.message.reply_text("⛔ Acesso não autorizado.")
+        await update.message.reply_text("Acesso nao autorizado.")
         return
 
     user_text = update.message.text
@@ -185,7 +193,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "content": user_text
     })
 
-    # Mantém histórico de no máximo 20 mensagens (10 trocas)
     if len(conversation_history[user_id]) > 20:
         conversation_history[user_id] = conversation_history[user_id][-20:]
 
@@ -196,15 +203,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         response = client.messages.create(
-            model="claude-haiku-4-5-20251001",  # mais barato, ótimo para este uso
+            model="claude-haiku-4-5-20251001",
             max_tokens=1500,
-            system=[
-                {
-                    "type": "text",
-                    "text": SYSTEM_PROMPT,
-                    "cache_control": {"type": "ephemeral"}  # prompt caching: economiza ~70%
-                }
-            ],
+            system=SYSTEM_PROMPT,
             messages=conversation_history[user_id]
         )
 
@@ -218,14 +219,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(assistant_reply)
 
     except Exception as e:
-        import traceback
-        logging.error(f"Erro na API Claude: {e}\n{traceback.format_exc()}")
+        logging.error(f"Erro na API Claude: {e}")
         await update.message.reply_text(
-            "⚠️ Ocorreu um erro ao processar sua mensagem. Tente novamente."
+            "Ocorreu um erro ao processar sua mensagem. Tente novamente."
         )
 
 
 def main():
+    if not ALLOWED_USER_IDS:
+        logging.warning(
+            "ALLOWED_USER_IDS is empty — all users will be blocked. "
+            "Set it in Replit Secrets as a comma-separated list of Telegram user IDs."
+        )
+    logging.info(f"Starting bot with {len(ALLOWED_USER_IDS)} allowed user(s)")
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset))
