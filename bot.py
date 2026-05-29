@@ -17,7 +17,14 @@ from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, fil
 # CONFIGURAÇÃO
 # ============================================================
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"].strip()
+_bad_chars = [c for c in ANTHROPIC_API_KEY if ord(c) > 127]
+if _bad_chars:
+    raise ValueError(
+        f"ANTHROPIC_API_KEY contains non-ASCII characters at positions "
+        f"{[ANTHROPIC_API_KEY.index(c) for c in _bad_chars]}: {_bad_chars!r}. "
+        "Please re-paste the key in Replit Secrets — it may have been copied with hidden Unicode characters."
+    )
 
 # IDs do Telegram de quem pode usar o bot
 # Para descobrir seu ID: fale com @userinfobot no Telegram
