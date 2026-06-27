@@ -34,7 +34,22 @@ if _bad_chars:
 
 _raw_ids = os.environ.get("ALLOWED_USER_IDS", "")
 ALLOWED_USER_IDS = [int(uid.strip()) for uid in _raw_ids.split(",") if uid.strip()]
+
+_raw_admin_ids = os.environ.get("ADMIN_USER_IDS", "")
+ADMIN_USER_IDS = [int(uid.strip()) for uid in _raw_admin_ids.split(",") if uid.strip()]
 # ============================================================
+
+_current_user_id: int | None = None
+
+
+def require_admin(feature_name: str) -> str | None:
+    """Return an error message if the current user is not an admin, else None."""
+    if _current_user_id not in ADMIN_USER_IDS:
+        return (
+            f"⛔ Acesso negado: voce nao tem permissao para usar {feature_name}. "
+            "Apenas administradores autorizados podem acessar esta funcionalidade."
+        )
+    return None
 
 logging.basicConfig(
     level=logging.INFO,
@@ -70,6 +85,10 @@ def calculate_payroll_deductions(teachers_json: str):
     Configuracao fixa: Province=Alberta, Pay frequency=Semi-monthly, Claim Code 1, Job Title=Teacher.
     Retorna o relatorio detalhado com: Federal tax, Provincial tax, CPP, CPP2, EI, Net pay, Employer costs.
     """
+    denied = require_admin("a calculadora de payroll")
+    if denied:
+        return denied
+
     import json
     try:
         teachers = json.loads(teachers_json)
@@ -109,6 +128,8 @@ SYSTEM_PROMPT = """
 # A calculadora retorna: Federal tax, Provincial tax (Alberta), CPP, CPP2, EI, Net pay, custos do empregador.
 # Sempre lembre o usuario de verificar os valores no PDOC oficial do CRA antes de processar a folha de pagamento real.
 # Se o usuario fornecer salario anual, divida por 24 para obter o valor semi-monthly antes de chamar a ferramenta.
+# IMPORTANTE: A calculadora de payroll requer permissao de administrador. Se a ferramenta retornar uma mensagem de acesso negado,
+# repasse essa mensagem ao usuario sem tentar contornar a restricao.
 """ 
 
 
@@ -176,6 +197,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     try:
+        global _current_user_id
+        _current_user_id = user_id
         response = agent.invoke({
             "messages": conversation_history[user_id]
         })
@@ -201,7 +224,7 @@ def main():
             "ALLOWED_USER_IDS is empty — all users will be blocked. "
             "Set it in Replit Secrets as a comma-separated list of Telegram user IDs."
         )
-    logging.info(f"Starting bot with {len(ALLOWED_USER_IDS)} allowed user(s)")
+    logging.info(f"Starting bot with {len(ALLOWED_USER_IDS)} allowed user(s), {len(ADMIN_USER_IDS)} admin(s)")
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset))
