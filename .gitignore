@@ -1,6 +1,6 @@
-# See https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files for more about ignoring files.
 
-# compiled output
+
+
 dist
 tmp
 out-tsc
@@ -8,10 +8,10 @@ out-tsc
 .expo
 .expo-shared
 
-# dependencies
+
 node_modules
 
-# IDEs and editors
+
 /.idea
 .project
 .classpath
@@ -51,3 +51,6 @@ src/__pycache__
 __pycache__
 
 .env
+chroma_db
+.claude
+.agents

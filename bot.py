@@ -29,7 +29,7 @@ _bad_chars = [c for c in ANTHROPIC_API_KEY if ord(c) > 127]
 if _bad_chars:
     raise ValueError(
         f"ANTHROPIC_API_KEY contains non-ASCII characters: {_bad_chars!r}. "
-        "Please re-paste the key in Replit Secrets."
+        
     )
 
 _raw_ids = os.environ.get("ALLOWED_USER_IDS", "")
@@ -39,25 +39,15 @@ _raw_admin_ids = os.environ.get("ADMIN_USER_IDS", "")
 ADMIN_USER_IDS = [int(uid.strip()) for uid in _raw_admin_ids.split(",") if uid.strip()]
 # ============================================================
 
-_current_user_id: int | None = None
-
-
-def require_admin(feature_name: str) -> str | None:
-    """Return an error message if the current user is not an admin, else None."""
-    if _current_user_id not in ADMIN_USER_IDS:
-        return (
-            f"⛔ Acesso negado: voce nao tem permissao para usar {feature_name}. "
-            "Apenas administradores autorizados podem acessar esta funcionalidade."
-        )
-    return None
-
 logging.basicConfig(
     level=logging.INFO,
     handlers=[logging.StreamHandler(stream=sys.stdout)],
 )
 
 model = init_chat_model(
-    model="claude-sonnet-4-6",)
+    model="claude-sonnet-4-6",
+    base_url="http://localhost:8000",
+    api_key=ANTHROPIC_API_KEY)
 
 @tool
 def retrieve_sop(query: str):
@@ -85,10 +75,6 @@ def calculate_payroll_deductions(teachers_json: str):
     Configuracao fixa: Province=Alberta, Pay frequency=Semi-monthly, Claim Code 1, Job Title=Teacher.
     Retorna o relatorio detalhado com: Federal tax, Provincial tax, CPP, CPP2, EI, Net pay, Employer costs.
     """
-    denied = require_admin("a calculadora de payroll")
-    if denied:
-        return denied
-
     import json
     try:
         teachers = json.loads(teachers_json)
@@ -111,7 +97,8 @@ def calculate_payroll_deductions(teachers_json: str):
     return format_multi_teacher_report(teachers)
 
 
-tools = [retrieve_sop, calculate_payroll_deductions]
+admin_tools = [retrieve_sop, calculate_payroll_deductions]
+non_admin_tools = [retrieve_sop]
 
 
 
@@ -128,17 +115,16 @@ SYSTEM_PROMPT = """
 # A calculadora retorna: Federal tax, Provincial tax (Alberta), CPP, CPP2, EI, Net pay, custos do empregador.
 # Sempre lembre o usuario de verificar os valores no PDOC oficial do CRA antes de processar a folha de pagamento real.
 # Se o usuario fornecer salario anual, divida por 24 para obter o valor semi-monthly antes de chamar a ferramenta.
-# IMPORTANTE: A calculadora de payroll requer permissao de administrador. Se a ferramenta retornar uma mensagem de acesso negado,
-# repasse essa mensagem ao usuario sem tentar contornar a restricao.
-""" 
+"""
 
 
 run_indexing()
 
 conversation_history: dict[int, list] = {}
-client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-agent = create_agent(model, tools, system_prompt=SYSTEM_PROMPT)
+
+admin_agent = create_agent(model, admin_tools, system_prompt=SYSTEM_PROMPT)
+non_admin_agent = create_agent(model, non_admin_tools, system_prompt=SYSTEM_PROMPT)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -171,8 +157,27 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Conversa reiniciada.")
 
 
+def _extract_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            block.get("text", "") if isinstance(block, dict) else str(block)
+            for block in content
+        )
+    return str(content)
+
+
+TELEGRAM_MSG_LIMIT = 4096
+
+async def _send_long_message(message, text: str):
+    for i in range(0, len(text), TELEGRAM_MSG_LIMIT):
+        await message.reply_text(text[i:i + TELEGRAM_MSG_LIMIT])
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    print(f"[1] received message from {user_id}")
 
     if user_id not in ALLOWED_USER_IDS:
         await update.message.reply_text("Acesso nao autorizado.")
@@ -197,22 +202,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     try:
-        global _current_user_id
-        _current_user_id = user_id
-        response = agent.invoke({
-            "messages": conversation_history[user_id]
-        })
-        assistant_reply = response["messages"][-1].content
+        current_agent = admin_agent if user_id in ADMIN_USER_IDS else non_admin_agent
+        print(f"[2] user authorised, sending to LLM")
+        response = current_agent.invoke(
+            {"messages": conversation_history[user_id]},
+            config={"recursion_limit": 5},
+        )
+        print(f"[3] got response back")
+        assistant_reply = _extract_text(response["messages"][-1].content)
 
         conversation_history[user_id].append({
             "role": "assistant",
             "content": assistant_reply
         })
 
-        await update.message.reply_text(assistant_reply)
+        await _send_long_message(update.message, assistant_reply)
+        print(f"[4] replied to user")
 
     except Exception as e:
         logging.error(f"Erro na API Claude: {e}")
+        import traceback
+        traceback.print_exc()
+        conversation_history[user_id].append({
+            "role": "assistant",
+            "content": "Ocorreu um erro ao processar sua mensagem. Tente novamente."
+        })
         await update.message.reply_text(
             "Ocorreu um erro ao processar sua mensagem. Tente novamente."
         )
@@ -222,7 +236,7 @@ def main():
     if not ALLOWED_USER_IDS:
         logging.warning(
             "ALLOWED_USER_IDS is empty — all users will be blocked. "
-            "Set it in Replit Secrets as a comma-separated list of Telegram user IDs."
+            
         )
     logging.info(f"Starting bot with {len(ALLOWED_USER_IDS)} allowed user(s), {len(ADMIN_USER_IDS)} admin(s)")
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
