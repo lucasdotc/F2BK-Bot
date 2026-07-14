@@ -10,10 +10,15 @@ import io
 import os
 import logging
 import anthropic
-from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
+from contextvars import ContextVar
+from datetime import date
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
 from src.config import vector_store
-from src.payroll import format_payroll_report, format_multi_teacher_report
+from src.payroll import format_payroll_report, format_multi_teacher_report, generate_payroll_csv
+
+_current_user_id: ContextVar[int | None] = ContextVar("current_user_id", default=None)
+_pending_csvs: dict[int, bytes] = {}
 os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
 if isinstance(sys.stdout, io.TextIOWrapper):
     sys.stdout.reconfigure(encoding='utf-8')
@@ -44,9 +49,13 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(stream=sys.stdout)],
 )
 
-model = init_chat_model(
+cached_model = init_chat_model(
     model="claude-sonnet-4-6",
     base_url="http://localhost:8000",
+    api_key=ANTHROPIC_API_KEY)
+
+direct_model = init_chat_model(
+    model="claude-sonnet-4-6",
     api_key=ANTHROPIC_API_KEY)
 
 @tool
@@ -92,14 +101,13 @@ def calculate_payroll_deductions(teachers_json: str):
         except (ValueError, TypeError):
             return f"Erro: gross_pay invalido para {t.get('name', '?')}."
 
+    uid = _current_user_id.get()
+    if uid is not None:
+        _pending_csvs[uid] = generate_payroll_csv(teachers)
+
     if len(teachers) == 1:
         return format_payroll_report(teachers[0]["name"], teachers[0]["gross_pay"])
     return format_multi_teacher_report(teachers)
-
-
-admin_tools = [retrieve_sop, calculate_payroll_deductions]
-non_admin_tools = [retrieve_sop]
-
 
 
 SYSTEM_PROMPT = """
@@ -120,11 +128,13 @@ SYSTEM_PROMPT = """
 
 run_indexing()
 
+admin_payroll_agent = create_agent(direct_model, [calculate_payroll_deductions], system_prompt=SYSTEM_PROMPT)
+admin_chatbot_agent = create_agent(cached_model, [retrieve_sop], system_prompt=SYSTEM_PROMPT)
+non_admin_agent = create_agent(cached_model, [retrieve_sop], system_prompt=SYSTEM_PROMPT)
+
 conversation_history: dict[int, list] = {}
+user_mode: dict[int, str] = {}
 
-
-admin_agent = create_agent(model, admin_tools, system_prompt=SYSTEM_PROMPT)
-non_admin_agent = create_agent(model, non_admin_tools, system_prompt=SYSTEM_PROMPT)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -132,21 +142,50 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Acesso nao autorizado.")
         return
     conversation_history[user_id] = []
-    await update.message.reply_text(
-        "Ola! Sou o assistente da escolinha.\n\n"
-        "Posso te guiar pelos processos internos:\n"
-        "- Onboarding/Offboarding de criancas\n"
-        "- Onboarding/Offboarding de professores\n"
-        "- Faturamento mensal (invoicing)\n\n"
-        "Tambem ajudo com:\n"
-        "- 📊 Calculadora de Payroll (CRA T4127 2026)\n"
-        "- Payroll e legislacao trabalhista Alberta\n"
-        "- Contabilidade e subsidios\n"
-        "- Marketing e comunicacao\n"
-        "- Pedagogia Reggio Emilia + Flight Framework\n"
-        "- Regulamentacoes child care Alberta\n\n"
-        "Como posso ajudar?"
-    )
+    user_mode.pop(user_id, None)
+
+    if user_id in ADMIN_USER_IDS:
+        keyboard = [
+            [InlineKeyboardButton("📊 Calculo de Payroll", callback_data="mode_payroll")],
+            [InlineKeyboardButton("💬 Modo Chatbot", callback_data="mode_chatbot")],
+        ]
+        await update.message.reply_text(
+            "Ola! O que voce gostaria de fazer?",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+    else:
+        user_mode[user_id] = "chatbot"
+        await update.message.reply_text(
+            "Ola! Sou o assistente da escolinha.\n\n"
+            "Posso te guiar pelos processos internos:\n"
+            "- Onboarding/Offboarding de criancas\n"
+            "- Onboarding/Offboarding de professores\n"
+            "- Faturamento mensal (invoicing)\n\n"
+            "Como posso ajudar?"
+        )
+
+
+async def handle_mode_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+
+    if user_id not in ALLOWED_USER_IDS or user_id not in ADMIN_USER_IDS:
+        await query.edit_message_text("Acesso nao autorizado.")
+        return
+
+    if query.data == "mode_payroll":
+        user_mode[user_id] = "payroll"
+        await query.edit_message_text(
+            "Modo Payroll ativado.\n"
+            "Informe o nome e o gross pay (semi-monthly) do(s) professor(es) e eu calculo as deducoes."
+        )
+    elif query.data == "mode_chatbot":
+        user_mode[user_id] = "chatbot"
+        await query.edit_message_text(
+            "Modo Chatbot ativado.\n"
+            "Posso te guiar pelos processos internos da escolinha. Como posso ajudar?"
+        )
 
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -183,6 +222,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Acesso nao autorizado.")
         return
 
+    if user_id not in user_mode:
+        await update.message.reply_text("Use /start para comecar.")
+        return
+
     user_text = update.message.text
 
     if user_id not in conversation_history:
@@ -202,12 +245,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     try:
-        current_agent = admin_agent if user_id in ADMIN_USER_IDS else non_admin_agent
+        mode = user_mode[user_id]
+        if mode == "payroll":
+            current_agent = admin_payroll_agent
+        elif user_id in ADMIN_USER_IDS:
+            current_agent = admin_chatbot_agent
+        else:
+            current_agent = non_admin_agent
         print(f"[2] user authorised, sending to LLM")
-        response = current_agent.invoke(
-            {"messages": conversation_history[user_id]},
-            config={"recursion_limit": 5},
-        )
+        token = _current_user_id.set(user_id)
+        try:
+            response = current_agent.invoke(
+                {"messages": conversation_history[user_id]},
+                config={"recursion_limit": 5},
+            )
+        finally:
+            _current_user_id.reset(token)
         print(f"[3] got response back")
         assistant_reply = _extract_text(response["messages"][-1].content)
 
@@ -217,6 +270,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         })
 
         await _send_long_message(update.message, assistant_reply)
+
+        csv_data = _pending_csvs.pop(user_id, None)
+        if csv_data:
+            filename = f"payroll_{date.today().isoformat()}.csv"
+            await update.message.reply_document(
+                document=io.BytesIO(csv_data),
+                filename=filename,
+            )
         print(f"[4] replied to user")
 
     except Exception as e:
@@ -242,6 +303,7 @@ def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset))
+    app.add_handler(CallbackQueryHandler(handle_mode_selection))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("Bot rodando...")
     app.run_polling()

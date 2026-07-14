@@ -174,6 +174,31 @@ def calculate_payroll(gross_pay: float) -> dict:
     }
 
 
+def generate_payroll_csv(teachers: list[dict]) -> bytes:
+    import csv
+    import io
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "Name", "Gross Pay (Period)", "Annual Gross",
+        "Federal Tax", "Provincial Tax", "CPP", "CPP2", "EI",
+        "Total Deductions", "Net Pay",
+        "Employer CPP", "Employer CPP2", "Employer EI", "Total Employer Cost",
+    ])
+    for t in teachers:
+        r = calculate_payroll(t["gross_pay"])
+        writer.writerow([
+            t["name"],
+            r["gross_pay"], r["annual_gross"],
+            r["federal_tax"], r["provincial_tax"],
+            r["cpp"], r["cpp2"], r["ei"],
+            r["total_deductions"], r["net_pay"],
+            r["employer_cpp"], r["employer_cpp2"], r["employer_ei"],
+            r["total_employer_cost"],
+        ])
+    return output.getvalue().encode("utf-8")
+
+
 def format_payroll_report(teacher_name: str, gross_pay: float) -> str:
 
 
