@@ -1,0 +1,9 @@
+chroma_db/
+knowledge/
+.env
+.env.*
+__pycache__/
+*.pyc
+.git/
+bot_out.txt
+bot_err.txt

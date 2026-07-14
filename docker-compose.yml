@@ -1,0 +1,12 @@
+services:
+  bot:
+    build: .
+    restart: always
+    env_file: .env
+    volumes:
+      - ./chroma_db:/app/chroma_db
+      - ./knowledge:/app/knowledge
+      - hf_cache:/root/.cache/huggingface
+
+volumes:
+  hf_cache:
