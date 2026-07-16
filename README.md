@@ -10,7 +10,7 @@ A private Telegram bot for daycare staff assistance. It uses RAG (retrieval-augm
   - Supports one or many teachers in a single request, with a per-teacher report plus a summary of totals
   - Generates a downloadable CSV of the results
   - **File upload support**: in Payroll mode, admins can send a `.csv` or `.xlsx` roster directly. The file's contents are handed to the Claude agent along with an instruction to read the `total` column as each teacher's gross pay and treat every value as a semi-monthly payment — the LLM interprets the sheet and calls the payroll tool itself
-- **Knowledge base sync from a private S3 bucket** (optional) — if configured, SOP `.md` files are pulled from a private S3 (or S3-compatible, e.g. Cloudflare R2) bucket into `knowledge/` before indexing, so SOPs never need to live in a shared deploy volume
+- **Knowledge base sync from a private S3 bucket**: SOP `.md` files are pulled from a private S3 (or S3-compatible, e.g. Cloudflare R2) bucket into `knowledge/` before indexing, so SOPs never need to live in a shared deploy volume
 - Persistent per-user conversation history (last 20 messages)
 - Access-controlled — only whitelisted Telegram user IDs can interact with the bot, with a separate admin allowlist for payroll access
 - `/start` to begin, `/reset` to clear conversation history
@@ -23,8 +23,7 @@ A private Telegram bot for daycare staff assistance. It uses RAG (retrieval-augm
 - [LangChain](https://github.com/langchain-ai/langchain) + Claude (`claude-sonnet-4-6`) via `init_chat_model`
 - [Chroma](https://www.trychroma.com/) for vector storage
 - [HuggingFace sentence-transformers](https://huggingface.co/sentence-transformers/all-mpnet-base-v2) for embeddings
-- [openpyxl](https://openpyxl.readthedocs.io/) for reading `.xlsx` payroll uploads
-- [boto3](https://boto3.amazonaws.com/v1/documentation/api/latest/index.html) for optional S3 knowledge sync
+- [boto3](https://boto3.amazonaws.com/v1/documentation/api/latest/index.html) for S3 knowledge sync
 - [uv](https://github.com/astral-sh/uv) for local dependency management / Docker + pip for deployment
 
 ## Setup
