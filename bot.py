@@ -5,6 +5,7 @@ from langchain.tools import tool
 from langchain.agents import create_agent
 from langchain.chat_models import init_chat_model
 from src.indexing import run_indexing
+from src.knowledge_sync import sync_knowledge_from_bucket
 import sys
 import io
 import os
@@ -15,7 +16,7 @@ from datetime import date
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
 from src.config import vector_store
-from src.payroll import format_payroll_report, format_multi_teacher_report, generate_payroll_csv
+from src.payroll import format_payroll_report, format_multi_teacher_report, generate_payroll_csv, extract_file_table
 
 _current_user_id: ContextVar[int | None] = ContextVar("current_user_id", default=None)
 _pending_csvs: dict[int, bytes] = {}
@@ -42,6 +43,8 @@ ALLOWED_USER_IDS = [int(uid.strip()) for uid in _raw_ids.split(",") if uid.strip
 
 _raw_admin_ids = os.environ.get("ADMIN_USER_IDS", "")
 ADMIN_USER_IDS = [int(uid.strip()) for uid in _raw_admin_ids.split(",") if uid.strip()]
+
+KNOWLEDGE_BUCKET = os.environ.get("KNOWLEDGE_BUCKET", "").strip()
 # ============================================================
 
 logging.basicConfig(
@@ -125,6 +128,14 @@ SYSTEM_PROMPT = """
 # Se o usuario fornecer salario anual, divida por 24 para obter o valor semi-monthly antes de chamar a ferramenta.
 """
 
+
+if KNOWLEDGE_BUCKET:
+    try:
+        sync_knowledge_from_bucket(KNOWLEDGE_BUCKET)
+    except Exception:
+        logging.exception(
+            f"Failed to sync knowledge docs from bucket '{KNOWLEDGE_BUCKET}' — indexing whatever is cached locally."
+        )
 
 run_indexing()
 
@@ -214,44 +225,13 @@ async def _send_long_message(message, text: str):
         await message.reply_text(text[i:i + TELEGRAM_MSG_LIMIT])
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    print(f"[1] received message from {user_id}")
-
-    if user_id not in ALLOWED_USER_IDS:
-        await update.message.reply_text("Acesso nao autorizado.")
-        return
-
-    if user_id not in user_mode:
-        await update.message.reply_text("Use /start para comecar.")
-        return
-
-    user_text = update.message.text
-
-    if user_id not in conversation_history:
-        conversation_history[user_id] = []
-
-    conversation_history[user_id].append({
-        "role": "user",
-        "content": user_text
-    })
-
-    if len(conversation_history[user_id]) > 20:
-        conversation_history[user_id] = conversation_history[user_id][-20:]
-
+async def _invoke_agent_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, current_agent):
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id,
         action="typing"
     )
 
     try:
-        mode = user_mode[user_id]
-        if mode == "payroll":
-            current_agent = admin_payroll_agent
-        elif user_id in ADMIN_USER_IDS:
-            current_agent = admin_chatbot_agent
-        else:
-            current_agent = non_admin_agent
         print(f"[2] user authorised, sending to LLM")
         token = _current_user_id.set(user_id)
         try:
@@ -293,6 +273,92 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if user_id not in ALLOWED_USER_IDS:
+        await update.message.reply_text("Acesso nao autorizado.")
+        return
+
+    if user_mode.get(user_id) != "payroll":
+        await update.message.reply_text(
+            "Envie planilhas apenas no modo Payroll. Use /start e selecione 'Calculo de Payroll'."
+        )
+        return
+
+    document = update.message.document
+    filename = document.file_name or ""
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    if ext not in ("csv", "xlsx"):
+        await update.message.reply_text("Envie um arquivo .csv ou .xlsx.")
+        return
+
+    tg_file = await document.get_file()
+    file_bytes = bytes(await tg_file.download_as_bytearray())
+
+    try:
+        table_text = extract_file_table(file_bytes, filename)
+    except ValueError as e:
+        await update.message.reply_text(f"Erro ao ler o arquivo: {e}")
+        return
+
+    instruction = (
+        f"O usuario enviou uma planilha ({filename}) com dados de professores para calculo de payroll.\n"
+        "Instrucoes para interpretar a planilha: procure a coluna 'total' para obter o salario de cada "
+        "professor e trate cada valor como um pagamento quinzenal (semi-monthly) nos calculos.\n\n"
+        f"Conteudo do arquivo:\n{table_text}"
+    )
+
+    if user_id not in conversation_history:
+        conversation_history[user_id] = []
+
+    conversation_history[user_id].append({
+        "role": "user",
+        "content": instruction
+    })
+
+    if len(conversation_history[user_id]) > 20:
+        conversation_history[user_id] = conversation_history[user_id][-20:]
+
+    await _invoke_agent_and_reply(update, context, user_id, admin_payroll_agent)
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    print(f"[1] received message from {user_id}")
+
+    if user_id not in ALLOWED_USER_IDS:
+        await update.message.reply_text("Acesso nao autorizado.")
+        return
+
+    if user_id not in user_mode:
+        await update.message.reply_text("Use /start para comecar.")
+        return
+
+    user_text = update.message.text
+
+    if user_id not in conversation_history:
+        conversation_history[user_id] = []
+
+    conversation_history[user_id].append({
+        "role": "user",
+        "content": user_text
+    })
+
+    if len(conversation_history[user_id]) > 20:
+        conversation_history[user_id] = conversation_history[user_id][-20:]
+
+    mode = user_mode[user_id]
+    if mode == "payroll":
+        current_agent = admin_payroll_agent
+    elif user_id in ADMIN_USER_IDS:
+        current_agent = admin_chatbot_agent
+    else:
+        current_agent = non_admin_agent
+
+    await _invoke_agent_and_reply(update, context, user_id, current_agent)
+
+
 def main():
     if not ALLOWED_USER_IDS:
         logging.warning(
@@ -304,6 +370,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CallbackQueryHandler(handle_mode_selection))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("Bot rodando...")
     app.run_polling()

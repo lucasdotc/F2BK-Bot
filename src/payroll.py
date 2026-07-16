@@ -174,6 +174,40 @@ def calculate_payroll(gross_pay: float) -> dict:
     }
 
 
+def _read_csv_rows(file_bytes: bytes) -> list[list]:
+    import csv
+    import io
+    text = file_bytes.decode("utf-8-sig")
+    return [row for row in csv.reader(io.StringIO(text)) if any(cell.strip() for cell in row)]
+
+
+def _read_xlsx_rows(file_bytes: bytes) -> list[list]:
+    import io
+    from openpyxl import load_workbook
+    wb = load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
+    ws = wb.active
+    rows = []
+    for row in ws.iter_rows(values_only=True):
+        if any(cell is not None and str(cell).strip() for cell in row):
+            rows.append(["" if c is None else c for c in row])
+    return rows
+
+
+def extract_file_table(file_bytes: bytes, filename: str) -> str:
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    if ext == "csv":
+        rows = _read_csv_rows(file_bytes)
+    elif ext == "xlsx":
+        rows = _read_xlsx_rows(file_bytes)
+    else:
+        raise ValueError("Formato nao suportado. Envie um arquivo .csv ou .xlsx.")
+
+    if not rows:
+        raise ValueError("O arquivo esta vazio.")
+
+    return "\n".join(",".join(str(cell) for cell in row) for row in rows)
+
+
 def generate_payroll_csv(teachers: list[dict]) -> bytes:
     import csv
     import io
