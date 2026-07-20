@@ -45,6 +45,8 @@ _raw_admin_ids = os.environ.get("ADMIN_USER_IDS", "")
 ADMIN_USER_IDS = [int(uid.strip()) for uid in _raw_admin_ids.split(",") if uid.strip()]
 
 KNOWLEDGE_BUCKET = os.environ.get("KNOWLEDGE_BUCKET", "").strip()
+
+CACHE_URL = os.environ.get("CACHE_URL", "").strip()
 # ============================================================
 
 logging.basicConfig(
@@ -54,7 +56,7 @@ logging.basicConfig(
 
 cached_model = init_chat_model(
     model="claude-sonnet-4-6",
-    base_url="https://greedless-unsure-gathering.ngrok-free.dev",
+    base_url=CACHE_URL,
     api_key=ANTHROPIC_API_KEY)
 
 direct_model = init_chat_model(
