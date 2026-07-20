@@ -54,7 +54,7 @@ logging.basicConfig(
 
 cached_model = init_chat_model(
     model="claude-sonnet-4-6",
-    base_url="https://proxy.15.175.29.132.nip.io",
+    base_url="https://greedless-unsure-gathering.ngrok-free.dev",
     api_key=ANTHROPIC_API_KEY)
 
 direct_model = init_chat_model(
