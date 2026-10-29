@@ -13,8 +13,8 @@ import logging
 import anthropic
 from contextvars import ContextVar
 from datetime import date
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
+from telegram import Update
+from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
 from src.config import vector_store
 from src.payroll import format_payroll_report, format_multi_teacher_report, generate_payroll_csv, extract_file_table
 
@@ -46,7 +46,6 @@ ADMIN_USER_IDS = [int(uid.strip()) for uid in _raw_admin_ids.split(",") if uid.s
 
 KNOWLEDGE_BUCKET = os.environ.get("KNOWLEDGE_BUCKET", "").strip()
 
-CACHE_URL = os.environ.get("CACHE_URL", "").strip()
 # ============================================================
 
 logging.basicConfig(
@@ -54,12 +53,7 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(stream=sys.stdout)],
 )
 
-cached_model = init_chat_model(
-    model="claude-sonnet-4-6",
-    base_url=CACHE_URL,
-    api_key=ANTHROPIC_API_KEY)
-
-direct_model = init_chat_model(
+model = init_chat_model(
     model="claude-sonnet-4-6",
     api_key=ANTHROPIC_API_KEY)
 
@@ -141,12 +135,10 @@ if KNOWLEDGE_BUCKET:
 
 run_indexing()
 
-admin_payroll_agent = create_agent(direct_model, [calculate_payroll_deductions], system_prompt=SYSTEM_PROMPT)
-admin_chatbot_agent = create_agent(cached_model, [retrieve_sop], system_prompt=SYSTEM_PROMPT)
-non_admin_agent = create_agent(cached_model, [retrieve_sop], system_prompt=SYSTEM_PROMPT)
+admin_agent = create_agent(model, [retrieve_sop, calculate_payroll_deductions], system_prompt=SYSTEM_PROMPT)
+non_admin_agent = create_agent(model, [retrieve_sop], system_prompt=SYSTEM_PROMPT)
 
 conversation_history: dict[int, list] = {}
-user_mode: dict[int, str] = {}
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -155,57 +147,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Acesso nao autorizado.")
         return
     conversation_history[user_id] = []
-    user_mode.pop(user_id, None)
+    await update.message.reply_text(
+        "Ola! Sou o assistente da escolinha.\n\n"
+        "Posso te guiar pelos processos internos e calcular folha de pagamento.\n"
+        "Como posso ajudar?"
+    )
 
-    if user_id in ADMIN_USER_IDS:
-        keyboard = [
-            [InlineKeyboardButton("📊 Calculo de Payroll", callback_data="mode_payroll")],
-            [InlineKeyboardButton("💬 Modo Chatbot", callback_data="mode_chatbot")],
-        ]
-        await update.message.reply_text(
-            "Ola! O que voce gostaria de fazer?",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-        )
-    else:
-        user_mode[user_id] = "chatbot"
-        await update.message.reply_text(
-            "Ola! Sou o assistente da escolinha.\n\n"
-            "Posso te guiar pelos processos internos:\n"
-            "- Onboarding/Offboarding de criancas\n"
-            "- Onboarding/Offboarding de professores\n"
-            "- Faturamento mensal (invoicing)\n\n"
-            "Como posso ajudar?"
-        )
-
-
-async def handle_mode_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-
-    if user_id not in ALLOWED_USER_IDS or user_id not in ADMIN_USER_IDS:
-        await query.edit_message_text("Acesso nao autorizado.")
-        return
-
-    if query.data == "mode_payroll":
-        user_mode[user_id] = "payroll"
-        text = (
-            "Modo Payroll ativado.\n"
-            "Informe o nome e o gross pay (semi-monthly) do(s) professor(es) e eu calculo as deducoes."
-        )
-    elif query.data == "mode_chatbot":
-        user_mode[user_id] = "chatbot"
-        text = (
-            "Modo Chatbot ativado.\n"
-            "Posso te guiar pelos processos internos da escolinha. Como posso ajudar?"
-        )
-    else:
-        return
-
-    try:
-        await query.edit_message_text(text)
-    except Exception:
-        await context.bot.send_message(chat_id=query.message.chat_id, text=text)
 
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -289,10 +236,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Acesso nao autorizado.")
         return
 
-    if user_mode.get(user_id) != "payroll":
-        await update.message.reply_text(
-            "Envie planilhas apenas no modo Payroll. Use /start e selecione 'Calculo de Payroll'."
-        )
+    if user_id not in ADMIN_USER_IDS:
+        await update.message.reply_text("Acesso nao autorizado.")
         return
 
     document = update.message.document
@@ -329,7 +274,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(conversation_history[user_id]) > 20:
         conversation_history[user_id] = conversation_history[user_id][-20:]
 
-    await _invoke_agent_and_reply(update, context, user_id, admin_payroll_agent)
+    await _invoke_agent_and_reply(update, context, user_id, admin_agent)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -338,10 +283,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if user_id not in ALLOWED_USER_IDS:
         await update.message.reply_text("Acesso nao autorizado.")
-        return
-
-    if user_id not in user_mode:
-        await update.message.reply_text("Use /start para comecar.")
         return
 
     user_text = update.message.text
@@ -357,14 +298,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(conversation_history[user_id]) > 20:
         conversation_history[user_id] = conversation_history[user_id][-20:]
 
-    mode = user_mode[user_id]
-    if mode == "payroll":
-        current_agent = admin_payroll_agent
-    elif user_id in ADMIN_USER_IDS:
-        current_agent = admin_chatbot_agent
-    else:
-        current_agent = non_admin_agent
-
+    current_agent = admin_agent if user_id in ADMIN_USER_IDS else non_admin_agent
     await _invoke_agent_and_reply(update, context, user_id, current_agent)
 
 
@@ -386,7 +320,6 @@ def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset))
-    app.add_handler(CallbackQueryHandler(handle_mode_selection))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(handle_error)
