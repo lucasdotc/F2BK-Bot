@@ -189,16 +189,23 @@ async def handle_mode_selection(update: Update, context: ContextTypes.DEFAULT_TY
 
     if query.data == "mode_payroll":
         user_mode[user_id] = "payroll"
-        await query.edit_message_text(
+        text = (
             "Modo Payroll ativado.\n"
             "Informe o nome e o gross pay (semi-monthly) do(s) professor(es) e eu calculo as deducoes."
         )
     elif query.data == "mode_chatbot":
         user_mode[user_id] = "chatbot"
-        await query.edit_message_text(
+        text = (
             "Modo Chatbot ativado.\n"
             "Posso te guiar pelos processos internos da escolinha. Como posso ajudar?"
         )
+    else:
+        return
+
+    try:
+        await query.edit_message_text(text)
+    except Exception:
+        await context.bot.send_message(chat_id=query.message.chat_id, text=text)
 
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -361,11 +368,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _invoke_agent_and_reply(update, context, user_id, current_agent)
 
 
+async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logging.error(f"Unhandled exception: {context.error}", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_message:
+        await update.effective_message.reply_text(
+            "Ocorreu um erro inesperado. Tente novamente ou use /start para reiniciar."
+        )
+
+
 def main():
     if not ALLOWED_USER_IDS:
         logging.warning(
             "ALLOWED_USER_IDS is empty — all users will be blocked. "
-            
+
         )
     logging.info(f"Starting bot with {len(ALLOWED_USER_IDS)} allowed user(s), {len(ADMIN_USER_IDS)} admin(s)")
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
@@ -374,6 +389,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_mode_selection))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_error_handler(handle_error)
     print("Bot rodando...")
     app.run_polling()
 
