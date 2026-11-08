@@ -170,7 +170,6 @@ def calculate_payroll(gross_pay: float) -> dict:
         "employer_cpp2": r2(employer_cpp2),
         "employer_ei": r2(employer_ei),
         "total_employer_cost": r2(total_employer_cost),
-        "annual_gross": r2(A),
     }
 
 
@@ -241,7 +240,7 @@ def format_payroll_report(teacher_name: str, gross_pay: float) -> str:
     lines = [
         f"📋 PAYROLL REPORT — {teacher_name.upper()}",
         f"   Job Title: Teacher | Province: Alberta | Pay frequency: Semi-monthly",
-        f"   Pay period gross: ${r['gross_pay']:,.2f}  (annual: ${r['annual_gross']:,.2f})",
+        f"   Pay period gross: ${r['gross_pay']:,.2f}",
         "",
         "── Employee Deductions ────────────────────",
         f"   CPP contribution:         ${r['cpp']:>9,.2f}",
