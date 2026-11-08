@@ -13,6 +13,8 @@ PAY_PERIODS = 24  # semi-monthly
 
 # --- CPP (Canada Pension Plan) ---
 CPP_RATE = 0.0595
+CPP_BASE_RATE = 0.0495
+CPP_BASE_MAX_ANNUAL = 3519.45
 CPP_BASIC_EXEMPTION = 3500.00
 CPP_YMPE = 74600.00  # Year's Maximum Pensionable Earnings
 CPP_MAX_ANNUAL = 4230.45
@@ -60,6 +62,7 @@ ALBERTA_BRACKETS = [
 ]
 ALBERTA_LOWEST_RATE = 0.08
 ALBERTA_BPA = 22769.00
+ALBERTA_K5P_THRESHOLD = 4896.00
 
 
 def _build_k_table(brackets):
@@ -102,36 +105,29 @@ def _federal_bpa(annual_income):
 def calculate_payroll(gross_pay: float) -> dict:
 
 
-    A = gross_pay * PAY_PERIODS  # annualized income
+    gross_annual = gross_pay * PAY_PERIODS
 
     # ---- CPP (employee) ----
-    pensionable = min(gross_pay, CPP_YMPE / PAY_PERIODS)
-    cpp = max(0.0, (pensionable - CPP_EXEMPTION_PER_PERIOD) * CPP_RATE)
-    cpp = min(cpp, CPP_MAX_ANNUAL / PAY_PERIODS)
+    # shortcut: no year-to-date tracking, so annual CPP/EI maximums and CPP2 (which only
+    # starts once YTD earnings pass the YMPE) are not applied; add YTD inputs to support that.
+    cpp = round(max(0.0, (gross_pay - CPP_EXEMPTION_PER_PERIOD) * CPP_RATE), 2)
+    cpp2 = 0.0
+    ei = round(gross_pay * EI_EMPLOYEE_RATE, 2)
 
-    # ---- CPP2 (employee) ----
-    if A > CPP_YMPE:
-        cpp2_base = min(A, CPP2_YAMPE) - CPP_YMPE
-        cpp2_annual = min(cpp2_base * CPP2_RATE, CPP2_MAX_ANNUAL)
-        cpp2 = cpp2_annual / PAY_PERIODS
-    else:
-        cpp2 = 0.0
+    # T4127: enhanced CPP (1% of 5.95%) and all CPP2 are deductions from income (F5);
+    # only base CPP (4.95%) earns the K2 credit.
+    f5 = cpp * (CPP_RATE - CPP_BASE_RATE) / CPP_RATE + cpp2
+    A = (gross_pay - f5) * PAY_PERIODS  # annual taxable income
 
-    # ---- EI (employee) ----
-    insurable = min(gross_pay, EI_MIE / PAY_PERIODS)
-    ei = min(insurable * EI_EMPLOYEE_RATE, EI_MAX_ANNUAL / PAY_PERIODS)
-
-    # ---- Annual deductible credits for tax calc ----
-    annual_cpp = cpp * PAY_PERIODS
-    annual_cpp2 = cpp2 * PAY_PERIODS
-    annual_ei = ei * PAY_PERIODS
+    annual_cpp_base = min(cpp * CPP_BASE_RATE / CPP_RATE * PAY_PERIODS, CPP_BASE_MAX_ANNUAL)
+    annual_ei = min(ei * PAY_PERIODS, EI_MAX_ANNUAL)
 
     # ---- Federal tax ----
     R, K = _bracket_lookup(FEDERAL_K, A)
     bpa = _federal_bpa(A)
     K1 = bpa * FEDERAL_LOWEST_RATE
-    K2 = (annual_cpp + annual_cpp2 + annual_ei) * FEDERAL_LOWEST_RATE
-    K3 = min(A, CEA) * FEDERAL_LOWEST_RATE
+    K2 = (annual_cpp_base + annual_ei) * FEDERAL_LOWEST_RATE
+    K3 = min(gross_annual, CEA) * FEDERAL_LOWEST_RATE
 
     federal_tax_annual = max(0.0, R * A - K - K1 - K2 - K3)
     federal_tax = federal_tax_annual / PAY_PERIODS
@@ -139,9 +135,10 @@ def calculate_payroll(gross_pay: float) -> dict:
     # ---- Alberta provincial tax ----
     V, KP = _bracket_lookup(ALBERTA_K, A)
     K1P = ALBERTA_BPA * ALBERTA_LOWEST_RATE
-    K2P = (annual_cpp + annual_cpp2 + annual_ei) * ALBERTA_LOWEST_RATE
+    K2P = (annual_cpp_base + annual_ei) * ALBERTA_LOWEST_RATE
 
-    provincial_tax_annual = max(0.0, V * A - KP - K1P - K2P)
+    K5P = max(0.0, (K1P + K2P - ALBERTA_K5P_THRESHOLD) * 0.25)
+    provincial_tax_annual = max(0.0, V * A - KP - K1P - K2P - K5P)
     provincial_tax = provincial_tax_annual / PAY_PERIODS
 
     # ---- Employee totals ----
@@ -170,6 +167,8 @@ def calculate_payroll(gross_pay: float) -> dict:
         "employer_cpp2": r2(employer_cpp2),
         "employer_ei": r2(employer_ei),
         "total_employer_cost": r2(total_employer_cost),
+        # summed from rounded parts so it matches what is actually remitted to CRA
+        "remittance": r2(r2(total_deductions) + r2(employer_cpp) + r2(employer_cpp2) + r2(employer_ei)),
     }
 
 
@@ -213,21 +212,21 @@ def generate_payroll_csv(teachers: list[dict]) -> bytes:
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow([
-        "Name", "Gross Pay (Period)", "Annual Gross",
+        "Name", "Gross Pay (Period)",
         "Federal Tax", "Provincial Tax", "CPP", "CPP2", "EI",
         "Total Deductions", "Net Pay",
-        "Employer CPP", "Employer CPP2", "Employer EI", "Total Employer Cost",
+        "Employer CPP", "Employer CPP2", "Employer EI", "Total Employer Cost", "Remittance",
     ])
     for t in teachers:
         r = calculate_payroll(t["gross_pay"])
         writer.writerow([
             t["name"],
-            r["gross_pay"], r["annual_gross"],
+            r["gross_pay"],
             r["federal_tax"], r["provincial_tax"],
             r["cpp"], r["cpp2"], r["ei"],
             r["total_deductions"], r["net_pay"],
             r["employer_cpp"], r["employer_cpp2"], r["employer_ei"],
-            r["total_employer_cost"],
+            r["total_employer_cost"], r["remittance"],
         ])
     return output.getvalue().encode("utf-8")
 
@@ -259,6 +258,7 @@ def format_payroll_report(teacher_name: str, gross_pay: float) -> str:
         f"   Employer EI:              ${r['employer_ei']:>9,.2f}",
         "",
         f"   💰 TOTAL EMPLOYER COST:    ${r['total_employer_cost']:>9,.2f}",
+        f"   🏦 CRA REMITTANCE:         ${r['remittance']:>9,.2f}",
     ]
     return "\n".join(lines)
 
@@ -270,7 +270,7 @@ def format_multi_teacher_report(teachers: list[dict]) -> str:
         "gross": 0.0, "federal_tax": 0.0, "provincial_tax": 0.0,
         "cpp": 0.0, "cpp2": 0.0, "ei": 0.0,
         "net_pay": 0.0, "employer_cpp": 0.0, "employer_cpp2": 0.0,
-        "employer_ei": 0.0, "total_employer_cost": 0.0,
+        "employer_ei": 0.0, "total_employer_cost": 0.0, "remittance": 0.0,
     }
 
     for t in teachers:
@@ -287,6 +287,7 @@ def format_multi_teacher_report(teachers: list[dict]) -> str:
         totals["employer_cpp2"] += r["employer_cpp2"]
         totals["employer_ei"] += r["employer_ei"]
         totals["total_employer_cost"] += r["total_employer_cost"]
+        totals["remittance"] += r["remittance"]
 
     separator = "\n\n" + "=" * 50 + "\n\n"
     report = separator.join(sections)
@@ -304,6 +305,7 @@ def format_multi_teacher_report(teachers: list[dict]) -> str:
     report += f"\n   Total employer CPP2:      ${totals['employer_cpp2']:>10,.2f}"
     report += f"\n   Total employer EI:        ${totals['employer_ei']:>10,.2f}"
     report += f"\n   Total employer cost:      ${totals['total_employer_cost']:>10,.2f}"
+    report += f"\n   Total CRA remittance:     ${totals['remittance']:>10,.2f}"
 
     report += "\n\n⚠️ Based on CRA T4127 formulas (2026). Claim Code 1 (basic personal amount only)."
     report += "\n   Verify against CRA PDOC before processing actual payroll."
