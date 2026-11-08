@@ -1,9 +1,6 @@
 from dotenv import load_dotenv
 load_dotenv()
 
-from langchain.tools import tool
-from langchain.agents import create_agent
-from langchain.chat_models import init_chat_model
 from src.indexing import run_indexing
 from src.knowledge_sync import sync_knowledge_from_bucket
 import sys
@@ -11,14 +8,12 @@ import io
 import os
 import logging
 import anthropic
-from contextvars import ContextVar
 from datetime import date
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
 from src.config import vector_store
 from src.payroll import format_payroll_report, format_multi_teacher_report, generate_payroll_csv, extract_file_table
 
-_current_user_id: ContextVar[int | None] = ContextVar("current_user_id", default=None)
 _pending_csvs: dict[int, bytes] = {}
 os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
 if isinstance(sys.stdout, io.TextIOWrapper):
@@ -53,36 +48,16 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(stream=sys.stdout)],
 )
 
-model = init_chat_model(
-    model="claude-sonnet-4-6",
-    api_key=ANTHROPIC_API_KEY)
+client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+MODEL = "claude-sonnet-4-6"
 
-@tool
-def retrieve_sop(query: str):
-    """
-    Consulta a base de conhecimento e retorna os passos relevantes para o processo operacional mencionado.
-    Use esta funcao quando o usuario mencionar onboarding, offboarding, invoicing ou outros processos internos.
-    """
+
+def retrieve_sop(query: str) -> str:
     retrieved_docs = vector_store.similarity_search(query, k=2)
-    serialized_docs = "\n\n".join([f"Source: {doc.metadata.get('source', 'Documento sem fonte')}\nContent:{doc.page_content}" for doc in retrieved_docs])
-    return serialized_docs
+    return "\n\n".join([f"Source: {doc.metadata.get('source', 'Documento sem fonte')}\nContent:{doc.page_content}" for doc in retrieved_docs])
 
-@tool
-def calculate_payroll_deductions(teachers_json: str):
-    """
-    Calcula as deducoes de folha de pagamento (payroll) para um ou mais professores usando as formulas oficiais do CRA T4127 (2026).
-    Use esta funcao quando o usuario pedir para calcular payroll, deducoes salariais, ou folha de pagamento.
 
-    O parametro teachers_json deve ser um JSON string com a lista de professores. Exemplo:
-    [{"name": "Maria Silva", "gross_pay": 2500.00}, {"name": "John Smith", "gross_pay": 3000.00}]
-
-    Cada professor deve ter:
-    - name: nome do professor
-    - gross_pay: valor bruto a receber no periodo quinzenal (semi-monthly)
-
-    Configuracao fixa: Province=Alberta, Pay frequency=Semi-monthly, Claim Code 1, Job Title=Teacher.
-    Retorna o relatorio detalhado com: Federal tax, Provincial tax, CPP, CPP2, EI, Net pay, Employer costs.
-    """
+def calculate_payroll_deductions(teachers_json: str, user_id: int | None = None) -> str:
     import json
     try:
         teachers = json.loads(teachers_json)
@@ -90,7 +65,7 @@ def calculate_payroll_deductions(teachers_json: str):
         return "Erro: formato JSON invalido. Envie uma lista como: [{\"name\": \"Nome\", \"gross_pay\": 2500.00}]"
 
     if not isinstance(teachers, list) or len(teachers) == 0:
-        return "Erro: envie uma lista com pelo menos um professor. Exemplo: [{\"name\": \"Nome\", \"gross_pay\": 2500.00}]"
+        return "Erro: envie uma lista com pelo menos um professor."
 
     for t in teachers:
         if "name" not in t or "gross_pay" not in t:
@@ -100,13 +75,73 @@ def calculate_payroll_deductions(teachers_json: str):
         except (ValueError, TypeError):
             return f"Erro: gross_pay invalido para {t.get('name', '?')}."
 
-    uid = _current_user_id.get()
-    if uid is not None:
-        _pending_csvs[uid] = generate_payroll_csv(teachers)
+    if user_id is not None:
+        _pending_csvs[user_id] = generate_payroll_csv(teachers)
 
     if len(teachers) == 1:
         return format_payroll_report(teachers[0]["name"], teachers[0]["gross_pay"])
     return format_multi_teacher_report(teachers)
+
+
+RETRIEVE_SOP_TOOL = {
+    "name": "retrieve_sop",
+    "description": "Consulta a base de conhecimento e retorna os passos relevantes para o processo operacional mencionado. Use quando o usuario mencionar onboarding, offboarding, invoicing ou outros processos internos.",
+    "input_schema": {
+        "type": "object",
+        "properties": {"query": {"type": "string", "description": "O termo ou processo a consultar"}},
+        "required": ["query"],
+    },
+}
+
+CALCULATE_PAYROLL_TOOL = {
+    "name": "calculate_payroll_deductions",
+    "description": "Calcula as deducoes de folha de pagamento para um ou mais professores usando as formulas oficiais do CRA T4127 (2026). Use quando o usuario pedir para calcular payroll, deducoes salariais, ou folha de pagamento. O parametro teachers_json deve ser um JSON string: [{\"name\": \"Nome\", \"gross_pay\": 2500.00}]. gross_pay eh o valor bruto semi-monthly. Retorna Federal tax, Provincial tax (Alberta), CPP, CPP2, EI, Net pay.",
+    "input_schema": {
+        "type": "object",
+        "properties": {"teachers_json": {"type": "string", "description": "JSON string com lista de professores: [{\"name\": \"...\", \"gross_pay\": 0.00}]"}},
+        "required": ["teachers_json"],
+    },
+}
+
+ADMIN_TOOLS = [RETRIEVE_SOP_TOOL, CALCULATE_PAYROLL_TOOL]
+NON_ADMIN_TOOLS = [RETRIEVE_SOP_TOOL]
+
+
+def _run_tool(name: str, tool_input: dict, user_id: int | None) -> str:
+    if name == "retrieve_sop":
+        return retrieve_sop(tool_input["query"])
+    if name == "calculate_payroll_deductions":
+        return calculate_payroll_deductions(tool_input["teachers_json"], user_id)
+    return f"Erro: ferramenta desconhecida '{name}'"
+
+
+def _invoke_with_tools(messages: list, tools: list, user_id: int | None) -> str:
+    """Run the Anthropic tool-use loop, return final assistant text."""
+    msgs = list(messages)
+    for _ in range(5):
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=4096,
+            system=SYSTEM_PROMPT,
+            tools=tools,
+            messages=msgs,
+        )
+        if response.stop_reason != "tool_use":
+            return "".join(b.text for b in response.content if b.type == "text")
+
+        tool_results = []
+        for block in response.content:
+            if block.type == "tool_use":
+                result = _run_tool(block.name, block.input, user_id)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": str(result),
+                })
+        msgs.append({"role": "assistant", "content": response.content})
+        msgs.append({"role": "user", "content": tool_results})
+
+    return "Desculpe, nao consegui processar sua solicitacao."
 
 
 SYSTEM_PROMPT = """
@@ -135,11 +170,11 @@ if KNOWLEDGE_BUCKET:
 
 run_indexing()
 
-admin_agent = create_agent(model, [retrieve_sop, calculate_payroll_deductions], system_prompt=SYSTEM_PROMPT)
-non_admin_agent = create_agent(model, [retrieve_sop], system_prompt=SYSTEM_PROMPT)
-
 conversation_history: dict[int, list] = {}
 
+
+PAYROLL_KEYWORDS = {"payroll", "folha de pagamento", "deducoes salariais", "salary deductions",
+                    "gross pay", "net pay", "cpp", "ei premium", "salario"}
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -181,7 +216,7 @@ async def _send_long_message(message, text: str):
         await message.reply_text(text[i:i + TELEGRAM_MSG_LIMIT])
 
 
-async def _invoke_agent_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, current_agent):
+async def _invoke_agent_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, tools: list):
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id,
         action="typing"
@@ -189,16 +224,8 @@ async def _invoke_agent_and_reply(update: Update, context: ContextTypes.DEFAULT_
 
     try:
         print(f"[2] user authorised, sending to LLM")
-        token = _current_user_id.set(user_id)
-        try:
-            response = current_agent.invoke(
-                {"messages": conversation_history[user_id]},
-                config={"recursion_limit": 5},
-            )
-        finally:
-            _current_user_id.reset(token)
+        assistant_reply = _invoke_with_tools(conversation_history[user_id], tools, user_id)
         print(f"[3] got response back")
-        assistant_reply = _extract_text(response["messages"][-1].content)
 
         conversation_history[user_id].append({
             "role": "assistant",
@@ -274,7 +301,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(conversation_history[user_id]) > 20:
         conversation_history[user_id] = conversation_history[user_id][-20:]
 
-    await _invoke_agent_and_reply(update, context, user_id, admin_agent)
+    await _invoke_agent_and_reply(update, context, user_id, ADMIN_TOOLS)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -298,9 +325,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(conversation_history[user_id]) > 20:
         conversation_history[user_id] = conversation_history[user_id][-20:]
 
-    current_agent = admin_agent if user_id in ADMIN_USER_IDS else non_admin_agent
-    await _invoke_agent_and_reply(update, context, user_id, current_agent)
-
+    is_payroll = any(kw in user_text.lower() for kw in PAYROLL_KEYWORDS)
+    if user_id in ADMIN_USER_IDS:
+        tools = ADMIN_TOOLS  # payroll tool is always available to admins
+    else:
+        tools = NON_ADMIN_TOOLS
+    await _invoke_agent_and_reply(update, context, user_id, tools)
 
 async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     logging.error(f"Unhandled exception: {context.error}", exc_info=context.error)
