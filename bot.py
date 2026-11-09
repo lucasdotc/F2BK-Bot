@@ -9,14 +9,16 @@ import os
 import logging
 import anthropic
 from datetime import date
-from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
 from src.config import vector_store
 from src.payroll import format_payroll_report, format_multi_teacher_report, generate_payroll_csv, extract_file_table, extract_file_rows
 from src.paystub import drafts_from_rows
+from src.gmail_sender import send_message
 
 _pending_csvs: dict[int, bytes] = {}
-_pending_drafts: dict[int, list[tuple[str, bytes]]] = {}
+_pending_drafts: dict[int, tuple[list, list[str]]] = {}  # drafts to preview after the reply
+_awaiting_send: dict[int, list] = {}  # previewed drafts waiting for the Send button
 _uploaded_tables: dict[int, tuple[bytes, str]] = {}  # last CSV/XLSX each admin sent
 os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
 if isinstance(sys.stdout, io.TextIOWrapper):
@@ -91,12 +93,14 @@ def draft_paystub_emails(user_id: int | None) -> str:
     if upload is None:
         return "Erro: nenhuma planilha enviada. Peca ao usuario para enviar o CSV com os dados dos funcionarios."
     try:
-        rows = extract_file_rows(*upload)
-        drafts = drafts_from_rows(rows)
+        drafts, skipped = drafts_from_rows(extract_file_rows(*upload))
     except ValueError as e:
         return f"Erro ao gerar rascunhos: {e}"
-    _pending_drafts[user_id] = drafts
-    return f"{len(drafts)} rascunho(s) de email gerado(s) a partir da planilha (nao enviados):\n" + "\n".join(f"- {n}" for n, _ in drafts)
+    _pending_drafts[user_id] = (drafts, skipped)
+    out = f"{len(drafts)} rascunho(s) preparados. Uma previa sera mostrada ao usuario com botoes Enviar/Cancelar; NADA foi enviado."
+    if skipped:
+        out += f"\nSem email (nao serao enviados): {', '.join(skipped)}"
+    return out
 
 
 RETRIEVE_SOP_TOOL = {
@@ -121,7 +125,7 @@ CALCULATE_PAYROLL_TOOL = {
 
 DRAFT_PAYSTUB_TOOL = {
     "name": "draft_paystub_emails",
-    "description": "Gera rascunhos de email de pay stub (.eml) com o PDF de deducoes anexado, um por funcionario, lendo TODOS os dados diretamente da ultima planilha CSV/XLSX enviada pelo usuario. NAO envia emails. Use quando o usuario pedir para preparar/rascunhar os emails ou pay stubs. Nao recebe parametros.",
+    "description": "Prepara os emails de pay stub (com o PDF de deducoes anexado), um por funcionario com email na planilha, lendo TODOS os dados diretamente da ultima planilha CSV/XLSX enviada. NAO envia: o usuario ve uma previa e confirma pelo botao Enviar. Use depois de calcular o payroll de uma planilha enviada, ou quando o usuario pedir os emails/pay stubs. Nao recebe parametros.",
     "input_schema": {"type": "object", "properties": {}},
 }
 
@@ -180,7 +184,8 @@ SYSTEM_PROMPT = """
 # O usuario vai fornecer: nome do professor e valor bruto (gross pay) por periodo quinzenal (semi-monthly).
 # A calculadora retorna: Federal tax, Provincial tax (Alberta), CPP, CPP2, EI, Net pay, custos do empregador.
 # Sempre lembre o usuario de verificar os valores no PDOC oficial do CRA antes de processar a folha de pagamento real.
-# Para gerar os rascunhos de email de pay stub (com PDF anexo), use a ferramenta draft_paystub_emails. Ela nao envia emails.
+# Depois de calcular o payroll de uma planilha enviada, chame tambem draft_paystub_emails para preparar os emails de pay stub.
+# Voce nunca envia emails: o usuario confirma o envio pelo botao Enviar na previa.
 # Se o usuario fornecer salario anual, divida por 24 para obter o valor semi-monthly antes de chamar a ferramenta.
 """
 
@@ -266,8 +271,8 @@ async def _invoke_agent_and_reply(update: Update, context: ContextTypes.DEFAULT_
                 document=io.BytesIO(csv_data),
                 filename=filename,
             )
-        for draft_name, draft_bytes in _pending_drafts.pop(user_id, []):
-            await update.message.reply_document(document=io.BytesIO(draft_bytes), filename=draft_name)
+        if user_id in _pending_drafts:
+            await _send_email_preview(update.message, user_id, *_pending_drafts.pop(user_id))
         print(f"[4] replied to user")
 
     except Exception as e:
@@ -281,6 +286,57 @@ async def _invoke_agent_and_reply(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text(
             "Ocorreu um erro ao processar sua mensagem. Tente novamente."
         )
+
+
+async def _send_email_preview(message, user_id: int, drafts: list, skipped: list[str]):
+    note = f"\n\nSem email na planilha (nao serao enviados): {', '.join(skipped)}" if skipped else ""
+    if not drafts:
+        await message.reply_text("Nenhum funcionario tem email na planilha, entao nenhum email sera enviado." + note)
+        return
+    first = drafts[0]
+    preview = f"PREVIA DO EMAIL (1 de {len(drafts)})\nPara: {first['To']}\nAssunto: {first['Subject']}\n\n{first.get_body().get_content()}"
+    await _send_long_message(message, preview)
+    pdf = next(first.iter_attachments())
+    await message.reply_document(document=io.BytesIO(pdf.get_content()), filename=pdf.get_filename())
+    recipients = "\n".join(f"- {m['To']} ({m['Subject'].split(' - ')[2]})" for m in drafts)
+    _awaiting_send[user_id] = drafts
+    await message.reply_text(
+        f"Enviar {len(drafts)} email(s) de f2bkagent@gmail.com para:\n{recipients}{note}",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("Enviar", callback_data="paystub_send"),
+            InlineKeyboardButton("Cancelar", callback_data="paystub_cancel"),
+        ]]),
+    )
+
+
+async def handle_send_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    await query.answer()
+    if user_id not in ADMIN_USER_IDS:
+        return
+    drafts = _awaiting_send.pop(user_id, None)  # pop: a second tap can't send twice
+    if drafts is None:
+        await query.edit_message_reply_markup(None)
+        await query.message.reply_text("Nada pendente para enviar.")
+        return
+    if query.data == "paystub_cancel":
+        await query.edit_message_text(query.message.text + "\n\nCancelado. Nenhum email enviado.")
+        return
+
+    await query.edit_message_text(query.message.text + "\n\nEnviando...")
+    sent, failed = [], []
+    for msg in drafts:
+        try:
+            send_message(msg)
+            sent.append(msg["To"])
+        except Exception as e:
+            logging.exception(f"Falha ao enviar para {msg['To']}")
+            failed.append(f"{msg['To']}: {e}")
+    report = f"Enviados: {len(sent)} de {len(drafts)}"
+    if failed:
+        report += "\nFalharam:\n" + "\n".join(failed)
+    await query.message.reply_text(report)
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -378,6 +434,7 @@ def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset))
+    app.add_handler(CallbackQueryHandler(handle_send_confirmation, pattern="^paystub_"))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(handle_error)

@@ -54,3 +54,8 @@ __pycache__
 chroma_db
 .claude
 .agents
+
+gmail_credentials.json
+gmail_token.json
+*.eml
+paystub_example.pdf

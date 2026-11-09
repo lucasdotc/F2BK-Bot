@@ -241,18 +241,22 @@ CSV_COLUMNS = {
 }
 
 
-def drafts_from_rows(rows: list[list]) -> list[tuple[str, bytes]]:
-    """Every value comes from the file itself; a missing column or blank cell is an error, never a default."""
+def drafts_from_rows(rows: list[list]) -> tuple[list[EmailMessage], list[str]]:
+    """Every value comes from the file itself; a missing column or blank cell is an error, never a default.
+    The one exception is Email: a row without one is skipped (returned in the second list), never emailed."""
     norm = lambda s: str(s).strip().lower()
     header = [norm(h) for h in rows[0]]
-    missing = [c for c in CSV_COLUMNS.values() if norm(c) not in header]
+    missing = [c for k, c in CSV_COLUMNS.items() if k != "email" and norm(c) not in header]
     if missing:
         raise ValueError(f"Colunas faltando no arquivo: {', '.join(missing)}")
-    idx = {k: header.index(norm(c)) for k, c in CSV_COLUMNS.items()}
+    idx = {k: header.index(norm(c)) for k, c in CSV_COLUMNS.items() if norm(c) in header}
 
-    drafts = []
+    drafts, skipped = [], []
     for n, row in enumerate(rows[1:], start=2):
         v = {k: str(row[i]).strip() if i < len(row) else "" for k, i in idx.items()}
+        if not v.get("email"):
+            skipped.append(v["name"] or f"Linha {n}")
+            continue
         blank = [CSV_COLUMNS[k] for k, x in v.items() if not x]
         if blank:
             raise ValueError(f"Linha {n}: valores vazios em {', '.join(blank)}")
@@ -262,9 +266,8 @@ def drafts_from_rows(rows: list[list]) -> list[tuple[str, bytes]]:
                     ("rate", "top_up_rate", "hours", "vacation_total", "vacation_used")}
         except ValueError as e:
             raise ValueError(f"Linha {n} ({v['name']}): {e}") from None
-        msg = build_paystub_email(v["name"], v["email"], paid, **nums)
-        drafts.append((f"Pay Stub - {v['name']} - {paid.isoformat()}.eml", bytes(msg)))
-    return drafts
+        drafts.append(build_paystub_email(v["name"], v["email"], paid, **nums))
+    return drafts, skipped
 
 
 if __name__ == "__main__":

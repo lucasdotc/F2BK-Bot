@@ -6,6 +6,7 @@ services:
     volumes:
       - ./chroma_db:/app/chroma_db
       - ./knowledge:/app/knowledge
+      - ./gmail_token.json:/app/gmail_token.json
       - hf_cache:/root/.cache/huggingface
 
 volumes:
