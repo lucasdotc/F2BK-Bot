@@ -12,9 +12,12 @@ from datetime import date
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
 from src.config import vector_store
-from src.payroll import format_payroll_report, format_multi_teacher_report, generate_payroll_csv, extract_file_table
+from src.payroll import format_payroll_report, format_multi_teacher_report, generate_payroll_csv, extract_file_table, extract_file_rows
+from src.paystub import drafts_from_rows
 
 _pending_csvs: dict[int, bytes] = {}
+_pending_drafts: dict[int, list[tuple[str, bytes]]] = {}
+_uploaded_tables: dict[int, tuple[bytes, str]] = {}  # last CSV/XLSX each admin sent
 os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
 if isinstance(sys.stdout, io.TextIOWrapper):
     sys.stdout.reconfigure(encoding='utf-8')
@@ -83,6 +86,19 @@ def calculate_payroll_deductions(teachers_json: str, user_id: int | None = None)
     return format_multi_teacher_report(teachers)
 
 
+def draft_paystub_emails(user_id: int | None) -> str:
+    upload = _uploaded_tables.get(user_id)
+    if upload is None:
+        return "Erro: nenhuma planilha enviada. Peca ao usuario para enviar o CSV com os dados dos funcionarios."
+    try:
+        rows = extract_file_rows(*upload)
+        drafts = drafts_from_rows(rows)
+    except ValueError as e:
+        return f"Erro ao gerar rascunhos: {e}"
+    _pending_drafts[user_id] = drafts
+    return f"{len(drafts)} rascunho(s) de email gerado(s) a partir da planilha (nao enviados):\n" + "\n".join(f"- {n}" for n, _ in drafts)
+
+
 RETRIEVE_SOP_TOOL = {
     "name": "retrieve_sop",
     "description": "Consulta a base de conhecimento e retorna os passos relevantes para o processo operacional mencionado. Use quando o usuario mencionar onboarding, offboarding, invoicing ou outros processos internos.",
@@ -103,7 +119,13 @@ CALCULATE_PAYROLL_TOOL = {
     },
 }
 
-ADMIN_TOOLS = [RETRIEVE_SOP_TOOL, CALCULATE_PAYROLL_TOOL]
+DRAFT_PAYSTUB_TOOL = {
+    "name": "draft_paystub_emails",
+    "description": "Gera rascunhos de email de pay stub (.eml) com o PDF de deducoes anexado, um por funcionario, lendo TODOS os dados diretamente da ultima planilha CSV/XLSX enviada pelo usuario. NAO envia emails. Use quando o usuario pedir para preparar/rascunhar os emails ou pay stubs. Nao recebe parametros.",
+    "input_schema": {"type": "object", "properties": {}},
+}
+
+ADMIN_TOOLS = [RETRIEVE_SOP_TOOL, CALCULATE_PAYROLL_TOOL, DRAFT_PAYSTUB_TOOL]
 NON_ADMIN_TOOLS = [RETRIEVE_SOP_TOOL]
 
 
@@ -112,6 +134,8 @@ def _run_tool(name: str, tool_input: dict, user_id: int | None) -> str:
         return retrieve_sop(tool_input["query"])
     if name == "calculate_payroll_deductions":
         return calculate_payroll_deductions(tool_input["teachers_json"], user_id)
+    if name == "draft_paystub_emails":
+        return draft_paystub_emails(user_id)
     return f"Erro: ferramenta desconhecida '{name}'"
 
 
@@ -156,6 +180,7 @@ SYSTEM_PROMPT = """
 # O usuario vai fornecer: nome do professor e valor bruto (gross pay) por periodo quinzenal (semi-monthly).
 # A calculadora retorna: Federal tax, Provincial tax (Alberta), CPP, CPP2, EI, Net pay, custos do empregador.
 # Sempre lembre o usuario de verificar os valores no PDOC oficial do CRA antes de processar a folha de pagamento real.
+# Para gerar os rascunhos de email de pay stub (com PDF anexo), use a ferramenta draft_paystub_emails. Ela nao envia emails.
 # Se o usuario fornecer salario anual, divida por 24 para obter o valor semi-monthly antes de chamar a ferramenta.
 """
 
@@ -241,6 +266,8 @@ async def _invoke_agent_and_reply(update: Update, context: ContextTypes.DEFAULT_
                 document=io.BytesIO(csv_data),
                 filename=filename,
             )
+        for draft_name, draft_bytes in _pending_drafts.pop(user_id, []):
+            await update.message.reply_document(document=io.BytesIO(draft_bytes), filename=draft_name)
         print(f"[4] replied to user")
 
     except Exception as e:
@@ -276,6 +303,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     tg_file = await document.get_file()
     file_bytes = bytes(await tg_file.download_as_bytearray())
+    _uploaded_tables[user_id] = (file_bytes, filename)
 
     try:
         table_text = extract_file_table(file_bytes, filename)

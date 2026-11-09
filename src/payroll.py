@@ -191,7 +191,7 @@ def _read_xlsx_rows(file_bytes: bytes) -> list[list]:
     return rows
 
 
-def extract_file_table(file_bytes: bytes, filename: str) -> str:
+def extract_file_rows(file_bytes: bytes, filename: str) -> list[list]:
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     if ext == "csv":
         rows = _read_csv_rows(file_bytes)
@@ -202,7 +202,11 @@ def extract_file_table(file_bytes: bytes, filename: str) -> str:
 
     if not rows:
         raise ValueError("O arquivo esta vazio.")
+    return rows
 
+
+def extract_file_table(file_bytes: bytes, filename: str) -> str:
+    rows = extract_file_rows(file_bytes, filename)
     return "\n".join(",".join(str(cell) for cell in row) for row in rows)
 
 
