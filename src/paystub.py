@@ -2,6 +2,7 @@
 
 from datetime import date
 from email.message import EmailMessage
+from html import escape
 
 from fpdf import FPDF
 
@@ -220,12 +221,60 @@ Best Regards,
 {SIGNATURE}
 """
 
+    # Same summary as an HTML two-column table (label | value), styled like the original spreadsheet.
+    # (label, value, is_money, label_bg, value_bg, indent)
+    table = [
+        ("Staff", name, False, None, "#daf0f2", False),
+        ("Pay date", short_date, False, None, None, False),
+        ("Rate", rate, True, None, None, False),
+        ("Top Up Rate", top_up_rate, True, None, None, False),
+        ("Pay date", short_date, False, None, None, False),
+        ("Hours", num(hours), False, None, None, False),
+        ("Base Salary", base, True, None, None, False),
+        ("Teaching", num(hours), False, None, None, False),
+        ("Topup Salary", topup, True, None, None, False),
+        ("Total", r["gross_pay"], True, None, None, False),
+        ("Employee Taxes", r["total_deductions"], True, None, None, False),
+        ("Net pay", r["net_pay"], True, "#00b0f0", None, False),
+        (f"Vacation Hours {pay_date.year}", num(vacation_total), False, None, None, False),
+        ("Used to date", num(vacation_used), False, None, "#ffc000", True),
+        ("Available Hours", num(vacation_total - vacation_used), False, None, None, True),
+    ]
+    cell = "border:1px solid #000;padding:4px 6px;"
+    trs = []
+    for label, value, is_money, label_bg, value_bg, indent in table:
+        lstyle = cell + "font-weight:bold;" + (f"background:{label_bg};" if label_bg else "") + ("padding-left:12px;" if indent else "")
+        vstyle = cell + (f"background:{value_bg};" if value_bg else "")
+        if label == "Staff":
+            val = f'<td style="{vstyle}font-weight:bold;height:60px;vertical-align:bottom;">{escape(value)}</td>'
+        elif is_money:
+            val = (f'<td style="{vstyle}"><table width="100%" cellpadding="0" cellspacing="0"><tr>'
+                   f'<td style="width:30%;text-align:right;">$</td><td style="text-align:right;">{_money(value)}</td>'
+                   f'</tr></table></td>')
+        else:
+            val = f'<td style="{vstyle}text-align:right;">{escape(str(value))}</td>'
+        trs.append(f'<tr><td style="{lstyle}">{escape(label)}</td>{val}</tr>')
+
+    para = lambda t: f"<p>{t}</p>"
+    html = (
+        '<div style="font-family:Calibri,Arial,sans-serif;font-size:11pt;">'
+        + para(f"Hi {escape(first)},")
+        + para(f"Attached you'll find the pay stub for the period between {period}")
+        + para("Please see summary below:")
+        + '<table cellpadding="0" cellspacing="0" style="border-collapse:collapse;min-width:360px;">'
+        + "".join(trs) + "</table><br><br>"
+        + para("You should be receiving an e-transfer shortly.")
+        + para("Thank you so very much for all your help so far this month.&nbsp; Very much appreciated")
+        + "<br>" + para("Best Regards,") + para(escape(SIGNATURE)) + "</div>"
+    )
+
     msg = EmailMessage()
     msg["From"] = SENDER
     msg["To"] = to
     msg["Subject"] = f"F2bk - Pay Stub - {name} - {mon} {_ordinal(pay_date.day)} {pay_date.year}"
     msg["X-Unsent"] = "1"  # Outlook / Apple Mail open the .eml as an editable draft
     msg.set_content(body)
+    msg.add_alternative(html, subtype="html")
     msg.add_attachment(
         build_paystub_pdf(name, pay_date, gross),
         maintype="application", subtype="pdf", filename=pdf_filename(name, pay_date),
@@ -274,7 +323,8 @@ if __name__ == "__main__":
     # Self-check against the real Oct 15 2026 stub for Letícia França.
     m = build_paystub_email("Letícia França", "employee@example.com", date(2026, 10, 15),
                             23.00, 8.62, 102, 160, 152)
-    text = m.get_body().get_content()
+    text = m.get_body(('plain',)).get_content()
+    assert "Leticia" not in m.get_body(('html',)).get_content() and "$</td><td style=\"text-align:right;\">3,225.24" in m.get_body(('html',)).get_content()
     for expected in ["Hi Letícia,", "between Oct 1st to 15th", "$ 2,346.00", "$ 879.24",
                      "$ 3,225.24", "$ 777.42", "$ 2,447.82", "Available Hours\n8\n"]:
         assert expected in text, expected

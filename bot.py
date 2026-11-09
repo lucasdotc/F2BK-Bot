@@ -294,7 +294,7 @@ async def _send_email_preview(message, user_id: int, drafts: list, skipped: list
         await message.reply_text("Nenhum funcionario tem email na planilha, entao nenhum email sera enviado." + note)
         return
     first = drafts[0]
-    preview = f"PREVIA DO EMAIL (1 de {len(drafts)})\nPara: {first['To']}\nAssunto: {first['Subject']}\n\n{first.get_body().get_content()}"
+    preview = f"PREVIA DO EMAIL (1 de {len(drafts)})\nPara: {first['To']}\nAssunto: {first['Subject']}\n\n{first.get_body(('plain',)).get_content()}"
     await _send_long_message(message, preview)
     pdf = next(first.iter_attachments())
     await message.reply_document(document=io.BytesIO(pdf.get_content()), filename=pdf.get_filename())

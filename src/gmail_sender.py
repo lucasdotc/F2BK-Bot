@@ -6,6 +6,7 @@ It reads the OAuth client file (GMAIL_CREDENTIALS_FILE) and writes the token (GM
 """
 
 import base64
+import json
 import os
 from email.message import EmailMessage
 
@@ -19,6 +20,14 @@ TOKEN_FILE = os.getenv("GMAIL_TOKEN_FILE", "gmail_token.json")
 
 
 def _credentials() -> Credentials:
+    # Hosts like Railway have no token file: paste the token's JSON into GMAIL_TOKEN_JSON instead.
+    # Refreshed access tokens then live in memory only; the refresh token itself doesn't change.
+    token_json = os.getenv("GMAIL_TOKEN_JSON")
+    if token_json:
+        creds = Credentials.from_authorized_user_info(json.loads(token_json), SCOPES)
+        if not creds.valid:
+            creds.refresh(Request())
+        return creds
     if not os.path.exists(TOKEN_FILE):
         raise RuntimeError(f"Gmail nao conectado: {TOKEN_FILE} nao existe. Rode `python -m src.gmail_sender`.")
     creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
