@@ -9,6 +9,7 @@ import os
 import logging
 from google import genai
 from google.genai import types
+from google.genai import errors as genai_errors
 from datetime import date
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
@@ -55,7 +56,13 @@ logging.basicConfig(
 )
 
 client = genai.Client(api_key=GEMINI_API_KEY)
-MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash").strip()
+# Comma-separated list, tried in order. When a model is overloaded or out of
+# free quota, the bot moves on to the next one.
+MODELS = [m.strip() for m in os.environ.get(
+    "GEMINI_MODEL",
+    "gemini-3.8-flash,gemini-3.5-flash,gemini-3.1-flash-lite,gemini-2.5-flash",
+).split(",") if m.strip()]
+_FALLBACK_CODES = {404, 429, 500, 503, 504}
 
 
 def retrieve_sop(query: str) -> str:
@@ -156,7 +163,21 @@ def _to_gemini_tool(tools: list) -> types.Tool:
 
 
 def _invoke_with_tools(messages: list, tools: list, user_id: int | None) -> str:
-    """Run the Gemini function-calling loop, return final model text."""
+    """Try each model in MODELS until one answers."""
+    last_error = None
+    for model in MODELS:
+        try:
+            return _run_model(model, messages, tools, user_id)
+        except genai_errors.APIError as e:
+            if e.code not in _FALLBACK_CODES:
+                raise
+            logging.warning(f"Gemini model {model} unavailable ({e.code}), trying next model")
+            last_error = e
+    raise last_error
+
+
+def _run_model(model: str, messages: list, tools: list, user_id: int | None) -> str:
+    """Run the Gemini function-calling loop on one model, return final model text."""
     contents = [
         types.Content(
             role="model" if m["role"] == "assistant" else "user",
@@ -171,7 +192,7 @@ def _invoke_with_tools(messages: list, tools: list, user_id: int | None) -> str:
         max_output_tokens=4096,
     )
     for _ in range(5):
-        response = client.models.generate_content(model=MODEL, contents=contents, config=config)
+        response = client.models.generate_content(model=model, contents=contents, config=config)
         calls = response.function_calls
         if not calls:
             return response.text or "Desculpe, nao consegui processar sua solicitacao."

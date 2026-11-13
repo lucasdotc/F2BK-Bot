@@ -20,7 +20,7 @@ A private Telegram bot for daycare staff assistance. It uses RAG (retrieval-augm
 
 - Python 3.11+
 - [python-telegram-bot](https://github.com/python-telegram-bot/python-telegram-bot)
-- [Google Gen AI SDK](https://pypi.org/project/google-genai/) (`google-genai`) with Gemini (`gemini-3.8-flash` by default, override with `GEMINI_MODEL`). Get a free API key at aistudio.google.com
+- [Google Gen AI SDK](https://pypi.org/project/google-genai/) (`google-genai`) with Gemini (tries `gemini-3.8-flash`, then falls back to other Flash models when one is busy; override the list with a comma-separated `GEMINI_MODEL`). Get a free API key at aistudio.google.com
 - [Chroma](https://www.trychroma.com/) for vector storage
 - [HuggingFace sentence-transformers](https://huggingface.co/sentence-transformers/all-mpnet-base-v2) for embeddings
 - [boto3](https://boto3.amazonaws.com/v1/documentation/api/latest/index.html) for S3 knowledge sync
