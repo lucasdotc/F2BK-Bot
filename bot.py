@@ -7,7 +7,8 @@ import sys
 import io
 import os
 import logging
-import anthropic
+from google import genai
+from google.genai import types
 from datetime import date
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
@@ -30,11 +31,11 @@ if isinstance(sys.stderr, io.TextIOWrapper):
 # CONFIGURACAO
 # ============================================================
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"].strip()
-_bad_chars = [c for c in ANTHROPIC_API_KEY if ord(c) > 127]
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"].strip()
+_bad_chars = [c for c in GEMINI_API_KEY if ord(c) > 127]
 if _bad_chars:
     raise ValueError(
-        f"ANTHROPIC_API_KEY contains non-ASCII characters: {_bad_chars!r}. "
+        f"GEMINI_API_KEY contains non-ASCII characters: {_bad_chars!r}. "
         f"Please check your environment variables."
     )
 
@@ -53,8 +54,8 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(stream=sys.stdout)],
 )
 
-client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-MODEL = "claude-sonnet-4-6"
+client = genai.Client(api_key=GEMINI_API_KEY)
+MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash").strip()
 
 
 def retrieve_sop(query: str) -> str:
@@ -143,31 +144,47 @@ def _run_tool(name: str, tool_input: dict, user_id: int | None) -> str:
     return f"Erro: ferramenta desconhecida '{name}'"
 
 
-def _invoke_with_tools(messages: list, tools: list, user_id: int | None) -> str:
-    """Run the Anthropic tool-use loop, return final assistant text."""
-    msgs = list(messages)
-    for _ in range(5):
-        response = client.messages.create(
-            model=MODEL,
-            max_tokens=4096,
-            system=SYSTEM_PROMPT,
-            tools=tools,
-            messages=msgs,
+def _to_gemini_tool(tools: list) -> types.Tool:
+    return types.Tool(function_declarations=[
+        types.FunctionDeclaration(
+            name=t["name"],
+            description=t["description"],
+            parameters_json_schema=t["input_schema"],
         )
-        if response.stop_reason != "tool_use":
-            return "".join(b.text for b in response.content if b.type == "text")
+        for t in tools
+    ])
 
-        tool_results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                result = _run_tool(block.name, block.input, user_id)
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": str(result),
-                })
-        msgs.append({"role": "assistant", "content": response.content})
-        msgs.append({"role": "user", "content": tool_results})
+
+def _invoke_with_tools(messages: list, tools: list, user_id: int | None) -> str:
+    """Run the Gemini function-calling loop, return final model text."""
+    contents = [
+        types.Content(
+            role="model" if m["role"] == "assistant" else "user",
+            parts=[types.Part.from_text(text=_extract_text(m["content"]))],
+        )
+        for m in messages
+    ]
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_PROMPT,
+        tools=[_to_gemini_tool(tools)],
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+        max_output_tokens=4096,
+    )
+    for _ in range(5):
+        response = client.models.generate_content(model=MODEL, contents=contents, config=config)
+        calls = response.function_calls
+        if not calls:
+            return response.text or "Desculpe, nao consegui processar sua solicitacao."
+
+        # Send the model's turn back unchanged so its thought signatures are kept.
+        contents.append(response.candidates[0].content)
+        contents.append(types.Content(role="user", parts=[
+            types.Part.from_function_response(
+                name=call.name,
+                response={"result": str(_run_tool(call.name, dict(call.args or {}), user_id))},
+            )
+            for call in calls
+        ]))
 
     return "Desculpe, nao consegui processar sua solicitacao."
 
@@ -276,7 +293,7 @@ async def _invoke_agent_and_reply(update: Update, context: ContextTypes.DEFAULT_
         print(f"[4] replied to user")
 
     except Exception as e:
-        logging.error(f"Erro na API Claude: {e}")
+        logging.error(f"Erro na API Gemini: {e}")
         import traceback
         traceback.print_exc()
         conversation_history[user_id].append({

@@ -2,7 +2,7 @@
 Run the RAG pipeline interactively without Telegram.
 
 Usage:
-    set ANTHROPIC_API_KEY=sk-...
+    set GEMINI_API_KEY=...
     python test_pipeline.py
 """
 

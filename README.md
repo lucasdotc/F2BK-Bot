@@ -1,6 +1,6 @@
 # F2BK Bot
 
-A private Telegram bot for daycare staff assistance. It uses RAG (retrieval-augmented generation) to answer questions about internal SOPs and processes, and can also calculate teacher payroll deductions — all powered by Claude and LangChain.
+A private Telegram bot for daycare staff assistance. It uses RAG (retrieval-augmented generation) to answer questions about internal SOPs and processes, and can also calculate teacher payroll deductions — powered by Google Gemini (free tier) with LangChain + Chroma for retrieval.
 
 ## Features
 
@@ -9,7 +9,7 @@ A private Telegram bot for daycare staff assistance. It uses RAG (retrieval-augm
 - **Payroll deductions calculator** — computes Federal tax, Provincial tax (Alberta), CPP, CPP2, EI, net pay, and employer costs using the official CRA T4127 (2026) formulas (semi-monthly pay periods, Claim Code 1)
   - Supports one or many teachers in a single request, with a per-teacher report plus a summary of totals
   - Generates a downloadable CSV of the results
-  - **File upload support**: in Payroll mode, admins can send a `.csv` or `.xlsx` roster directly. The file's contents are handed to the Claude agent along with an instruction to read the `total` column as each teacher's gross pay and treat every value as a semi-monthly payment — the LLM interprets the sheet and calls the payroll tool itself
+  - **File upload support**: in Payroll mode, admins can send a `.csv` or `.xlsx` roster directly. The file's contents are handed to the Gemini agent along with an instruction to read the `total` column as each teacher's gross pay and treat every value as a semi-monthly payment — the LLM interprets the sheet and calls the payroll tool itself
 - **Knowledge base sync from a private S3 bucket**: SOP `.md` files are pulled from a private S3 (or S3-compatible, e.g. Cloudflare R2) bucket into `knowledge/` before indexing, so SOPs never need to live in a shared deploy volume
 - Persistent per-user conversation history (last 20 messages)
 - Access-controlled — only whitelisted Telegram user IDs can interact with the bot, with a separate admin allowlist for payroll access
@@ -20,7 +20,7 @@ A private Telegram bot for daycare staff assistance. It uses RAG (retrieval-augm
 
 - Python 3.11+
 - [python-telegram-bot](https://github.com/python-telegram-bot/python-telegram-bot)
-- [LangChain](https://github.com/langchain-ai/langchain) + Claude (`claude-sonnet-4-6`) via `init_chat_model`
+- [Google Gen AI SDK](https://pypi.org/project/google-genai/) (`google-genai`) with Gemini (`gemini-3.8-flash` by default, override with `GEMINI_MODEL`). Get a free API key at aistudio.google.com
 - [Chroma](https://www.trychroma.com/) for vector storage
 - [HuggingFace sentence-transformers](https://huggingface.co/sentence-transformers/all-mpnet-base-v2) for embeddings
 - [boto3](https://boto3.amazonaws.com/v1/documentation/api/latest/index.html) for S3 knowledge sync
@@ -36,7 +36,7 @@ A private Telegram bot for daycare staff assistance. It uses RAG (retrieval-augm
 2. **Configure environment variables** — create a `.env` file:
    ```env
    TELEGRAM_TOKEN=your_telegram_bot_token
-   ANTHROPIC_API_KEY=your_anthropic_api_key
+   GEMINI_API_KEY=your_gemini_api_key
    ALLOWED_USER_IDS=123456789,987654321
    ADMIN_USER_IDS=123456789
 
