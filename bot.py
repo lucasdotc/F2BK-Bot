@@ -7,6 +7,9 @@ import sys
 import io
 import os
 import logging
+import time
+import asyncio
+import httpx
 from google import genai
 from google.genai import types
 from google.genai import errors as genai_errors
@@ -55,7 +58,9 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(stream=sys.stdout)],
 )
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+# Without a timeout a stuck request waits forever; 60s lets the next model take over.
+GEMINI_TIMEOUT_MS = int(os.environ.get("GEMINI_TIMEOUT_MS", "60000"))
+client = genai.Client(api_key=GEMINI_API_KEY, http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_MS))
 # Comma-separated list, tried in order. When a model is overloaded or out of
 # free quota, the bot moves on to the next one.
 MODELS = [m.strip() for m in os.environ.get(
@@ -63,6 +68,14 @@ MODELS = [m.strip() for m in os.environ.get(
     "gemini-3.8-flash,gemini-3.5-flash,gemini-3.1-flash-lite,gemini-2.5-flash",
 ).split(",") if m.strip()]
 _FALLBACK_CODES = {404, 429, 500, 503, 504}
+try:
+    import httpx2
+except ImportError:
+    httpx2 = None
+_NETWORK_ERRORS = tuple(
+    cls for mod in (httpx, httpx2) if mod is not None
+    for cls in (mod.TimeoutException, mod.ConnectError)
+)
 
 
 def retrieve_sop(query: str) -> str:
@@ -166,12 +179,19 @@ def _invoke_with_tools(messages: list, tools: list, user_id: int | None) -> str:
     """Try each model in MODELS until one answers."""
     last_error = None
     for model in MODELS:
+        start = time.monotonic()
+        logging.info(f"Calling Gemini model {model}")
         try:
-            return _run_model(model, messages, tools, user_id)
+            reply = _run_model(model, messages, tools, user_id)
+            logging.info(f"Gemini model {model} answered in {time.monotonic() - start:.1f}s")
+            return reply
         except genai_errors.APIError as e:
             if e.code not in _FALLBACK_CODES:
                 raise
             logging.warning(f"Gemini model {model} unavailable ({e.code}), trying next model")
+            last_error = e
+        except _NETWORK_ERRORS as e:
+            logging.warning(f"Gemini model {model} timed out or unreachable after {time.monotonic() - start:.1f}s ({type(e).__name__}), trying next model")
             last_error = e
     raise last_error
 
@@ -292,7 +312,10 @@ async def _invoke_agent_and_reply(update: Update, context: ContextTypes.DEFAULT_
 
     try:
         print(f"[2] user authorised, sending to LLM")
-        assistant_reply = _invoke_with_tools(conversation_history[user_id], tools, user_id)
+        # Run the blocking Gemini call in a thread so the bot keeps serving other users.
+        assistant_reply = await asyncio.to_thread(
+            _invoke_with_tools, list(conversation_history[user_id]), tools, user_id
+        )
         print(f"[3] got response back")
 
         conversation_history[user_id].append({
